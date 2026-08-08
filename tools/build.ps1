@@ -1,7 +1,8 @@
 param(
     [ValidateSet("Debug", "Release", "RelWithDebInfo")]
     [string]$Configuration = "Release",
-    [switch]$Headless
+    [switch]$Headless,
+    [switch]$Cuda
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,10 +40,14 @@ if (-not (Test-Path -LiteralPath $cmake) -or -not (Test-Path -LiteralPath $ctest
     throw "Visual Studio's CMake tools were not found"
 }
 
-$build_directory = Join-Path $workspace "build-neurosim"
+$build_directory_name = if ($Cuda) { "build-neurosim-cuda" } else { "build-neurosim" }
+$build_directory = Join-Path $workspace $build_directory_name
 $viewer = if ($Headless) { "OFF" } else { "ON" }
+$cuda_backend = if ($Cuda) { "ON" } else { "OFF" }
 
-& $cmake -S $workspace -B $build_directory -G $generator -A x64 "-DNEUROSIM_BUILD_VIEWER=$viewer"
+& $cmake -S $workspace -B $build_directory -G $generator -A x64 `
+    "-DNEUROSIM_BUILD_VIEWER=$viewer" `
+    "-DNEUROSIM_BUILD_CUDA=$cuda_backend"
 
 if ($LASTEXITCODE -ne 0)
 {

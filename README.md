@@ -1,10 +1,23 @@
 # neurosim
 
-A continuous-space procedural dungeon environment for developing a biological-neuron-based agent from scratch.
+A from-scratch biological-neuron-inspired system and a continuous-space task environment for developing it.
 
-The current slice is deliberately small: one square agent moves through connected rooms and hallways, eats pellets, and obeys fixed episode rules. The simulation is independent from rendering so the same C++ API can drive interactive play, deterministic replay, or a future neural controller.
+The project currently has two independent pieces: a playable procedural dungeon and the first sparse three-dimensional spiking brain model. They are intentionally not connected yet, so model behavior can be tested without game or rendering concerns.
 
-## Rules
+## Brain model
+
+- Neurons occupy selected cells of a discrete 3D lattice; unoccupied cells stay empty.
+- Every occupied cell within two Manhattan steps is a potential directed connection.
+- Neurons use normalized leaky integrate-and-fire dynamics with one-tick signal delay.
+- Excitatory and inhibitory neurons give outgoing signals a fixed sign.
+- Local joint activity strengthens a directed connection, while inactivity weakens it.
+- Each neuron has one outgoing strength budget, so saturated connections compete.
+- Input and output channels are ordered lists of arbitrary neuron positions rather than fixed regions.
+- Full reset restores seeded weights; activity reset preserves learning between episodes.
+
+The exact equations, units, update order, assumptions, and biological limitations are recorded in [docs/brain-model.md](docs/brain-model.md). The model has no backpropagation, gradients, reward signal, action decoder, or game integration.
+
+## Dungeon rules
 
 - Actions combine `up`, `down`, `left`, and `right`, allowing diagonal movement.
 - Movement accelerates toward one shared maximum speed in every direction and brakes toward rest on `none`.
@@ -31,6 +44,14 @@ Use `-Configuration Debug` for a debug build or `-Headless` to avoid fetching an
 .\tools\build.ps1 -Headless
 ```
 
+The CUDA backend is explicit and uses a separate build directory:
+
+```powershell
+.\tools\build.ps1 -Headless -Cuda
+```
+
+`-Cuda` requires an installed CUDA Toolkit with `nvcc`; requesting it without a compiler fails configuration rather than falling back to the CPU. `NEUROSIM_CUDA_ARCHITECTURES` defaults to CMake's portable `all-major` set and can be overridden for a local build, such as `86` for an RTX 3060 Ti.
+
 On other platforms, configure normally with CMake and set `NEUROSIM_BUILD_VIEWER=OFF` when raylib is not wanted.
 
 ## Run
@@ -49,9 +70,12 @@ The headless executable emits one JSON object per completed episode. Its built-i
 
 ## Architecture
 
-- `neurosim_core` owns dungeon generation, continuous collision, episode state, and game rules.
+- `neurosim_core` owns the sparse brain model, CPU reference backend, dungeon generation, collision, and game rules.
+- `neurosim_cuda` is an optional explicit backend over the same compiled brain arrays and tick order.
 - `neurosim_game` is a raylib client of the core environment.
 - `neurosim_headless` demonstrates rendering-free episode execution.
-- `neurosim_tests` covers generation determinism, variation, movement, collision, pickup, timing, and reset behavior.
+- `neurosim_tests` covers environment generation, movement, collision, pickup, timing, and reset behavior.
+- `neurosim_brain_tests` covers topology, dynamics, inhibition, learning, competition, decay, delay, and reset behavior.
+- `neurosim_cuda_tests` compares every CUDA tick with the CPU reference when that backend is built.
 
-CUDA is intentionally absent from this environment slice. A single moving body is cheaper on the CPU; CUDA will be introduced for parallel neuron and synapse computation with C++ parity tests when that work begins.
+CUDA remains absent from the cheap game simulation. The first GPU backend uses reusable contiguous buffers and separate neuron and plasticity kernels, but one small brain may still be slower than the CPU because of launch and synchronization overhead. Large networks and future batches of evolving brains are the intended acceleration case.
