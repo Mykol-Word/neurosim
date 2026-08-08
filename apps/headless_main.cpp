@@ -33,11 +33,15 @@ Action scripted_action(uint64_t seed, uint64_t tick)
 {
     using enum Action;
 
-    static constexpr array<Action, 5> ACTIONS{
+    static constexpr array<Action, 9> ACTIONS{
         Up,
+        Up | Right,
         Right,
+        Down | Right,
         Down,
+        Down | Left,
         Left,
+        Up | Left,
         None
     };
     const uint64_t phase = tick / 90U;

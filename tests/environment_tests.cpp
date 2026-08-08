@@ -71,6 +71,12 @@ EnvironmentConfig make_test_config()
     return config;
 }
 
+// verifies the default player speed uses the raised limit
+void test_default_speed_limit()
+{
+    check_near(EnvironmentConfig{}.max_speed, 12.0f, 0.0001f, "default maximum speed is incorrect");
+}
+
 // verifies seeded generation determinism, validity, and variation
 void test_generation_is_deterministic_and_varied()
 {
@@ -130,6 +136,42 @@ void test_acceleration_speed_cap_and_braking()
     check_near(environment.state().velocity.x, 2.0f, 0.0001f, "no-op did not apply braking");
     environment.step(None);
     check_near(environment.state().velocity.x, 0.0f, 0.0001f, "braking did not stop at zero");
+}
+
+// verifies combined movement stays within one shared speed limit
+void test_combined_movement_respects_speed_limit()
+{
+    using enum Action;
+
+    EnvironmentConfig config = make_test_config();
+    config.fixed_time_step = 1.0f;
+    config.acceleration = 100.0f;
+    const Dungeon dungeon = make_test_dungeon(
+        {0.0f, 0.0f, 100.0f, 100.0f},
+        {50.0f, 50.0f},
+        {{90.0f, 90.0f}});
+    Environment environment(config, 1);
+    environment.reset(dungeon);
+    environment.step(Up | Right);
+
+    const float expected_component = config.max_speed / sqrt(2.0f);
+    check_near(environment.state().velocity.x, expected_component, 0.0001f,
+        "diagonal horizontal speed is incorrect");
+    check_near(environment.state().velocity.y, -expected_component, 0.0001f,
+        "diagonal vertical speed is incorrect");
+    check_near(length(environment.state().velocity), config.max_speed, 0.0001f,
+        "diagonal movement exceeded the maximum speed");
+
+    environment.reset(dungeon);
+    environment.step(Up | Down | Right);
+    check_near(environment.state().velocity.x, config.max_speed, 0.0001f,
+        "opposing vertical inputs did not cancel");
+    check_near(environment.state().velocity.y, 0.0f, 0.0001f,
+        "opposing vertical inputs produced movement");
+
+    environment.step(Up | Down);
+    check_near(length(environment.state().velocity), 0.0f, 0.0001f,
+        "fully opposing inputs did not brake to rest");
 }
 
 // verifies continuous collision clamping prevents wall tunneling
@@ -319,7 +361,9 @@ int main()
 {
     const vector<pair<const char*, function<void()>>> tests{
         {"generation_is_deterministic_and_varied", test_generation_is_deterministic_and_varied},
+        {"default_speed_limit", test_default_speed_limit},
         {"acceleration_speed_cap_and_braking", test_acceleration_speed_cap_and_braking},
+        {"combined_movement_respects_speed_limit", test_combined_movement_respects_speed_limit},
         {"wall_collision_clamps_without_tunneling", test_wall_collision_clamps_without_tunneling},
         {"swept_pickup_and_no_double_eat", test_swept_pickup_and_no_double_eat},
         {"starvation_exact_tick", test_starvation_exact_tick},

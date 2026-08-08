@@ -72,26 +72,34 @@ uint64_t seconds_to_ticks(double seconds, float fixed_time_step)
     return static_cast<uint64_t>(ticks);
 }
 
-// maps one discrete action to its unit movement direction
+// returns whether a combined action contains one movement input
+bool has_action(Action actions, Action action)
+{
+    return (static_cast<uint8_t>(actions) & static_cast<uint8_t>(action)) != 0;
+}
+
+// maps simultaneous movement inputs to one unit direction
 Vec2 action_direction(Action action)
 {
     using enum Action;
 
-    switch (action)
+    constexpr uint8_t VALID_ACTIONS = static_cast<uint8_t>(Up)
+        | static_cast<uint8_t>(Down)
+        | static_cast<uint8_t>(Left)
+        | static_cast<uint8_t>(Right);
+    const uint8_t action_bits = static_cast<uint8_t>(action);
+
+    if ((action_bits & ~VALID_ACTIONS) != 0)
     {
-    case None:
-        return {};
-    case Up:
-        return {0.0f, -1.0f};
-    case Down:
-        return {0.0f, 1.0f};
-    case Left:
-        return {-1.0f, 0.0f};
-    case Right:
-        return {1.0f, 0.0f};
+        throw invalid_argument("unknown environment action");
     }
 
-    throw invalid_argument("unknown environment action");
+    const Vec2 direction{
+        static_cast<float>(has_action(action, Right)) - static_cast<float>(has_action(action, Left)),
+        static_cast<float>(has_action(action, Down)) - static_cast<float>(has_action(action, Up))
+    };
+    const float direction_length = length(direction);
+    return direction_length == 0.0f ? Vec2{} : direction / direction_length;
 }
 
 // moves a vector toward a target without exceeding a maximum change
@@ -232,7 +240,7 @@ StepResult Environment::step(Action action)
 
     const Vec2 direction = action_direction(action);
     const Vec2 target_velocity = direction * config_.max_speed;
-    const float rate = action == Action::None ? config_.braking : config_.acceleration;
+    const float rate = direction == Vec2{} ? config_.braking : config_.acceleration;
     state_.velocity = move_toward(state_.velocity, target_velocity, rate * config_.fixed_time_step);
 
     const Vec2 start = state_.position;

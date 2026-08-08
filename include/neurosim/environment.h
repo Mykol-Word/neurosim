@@ -10,15 +10,21 @@ namespace neurosim
 
 using namespace std;
 
-// identifies one cardinal or idle environment action
+// identifies simultaneous cardinal movement inputs
 enum class Action : uint8_t
 {
-    None,
-    Up,
-    Down,
-    Left,
-    Right
+    None = 0,
+    Up = 1 << 0,
+    Down = 1 << 1,
+    Left = 1 << 2,
+    Right = 1 << 3
 };
+
+// combines simultaneous movement inputs
+constexpr Action operator|(Action left, Action right)
+{
+    return static_cast<Action>(static_cast<uint8_t>(left) | static_cast<uint8_t>(right));
+}
 
 // identifies why an episode stopped
 enum class TerminationReason : uint8_t
@@ -37,7 +43,7 @@ struct EnvironmentConfig
     float player_size = 1.4f;
     float acceleration = 30.0f;
     float braking = 42.0f;
-    float max_speed = 8.0f;
+    float max_speed = 12.0f;
     double starvation_seconds = 15.0;
     double time_limit_seconds = 300.0;
 };
@@ -113,4 +119,3 @@ private:
 const char* termination_name(TerminationReason reason);
 
 }
-

@@ -26,6 +26,8 @@ constexpr int MINIMUM_WIDTH = 800;
 constexpr int MINIMUM_HEIGHT = 500;
 constexpr int HUD_HEIGHT = 76;
 constexpr float VIEW_PADDING = 28.0f;
+constexpr float VISION_RADIUS_PIXELS = 200.0f;
+constexpr int VISION_MASK_SEGMENTS = 128;
 constexpr float RESET_DELAY_SECONDS = 2.0f;
 constexpr double MAX_FRAME_SECONDS = 0.25;
 
@@ -175,14 +177,8 @@ bool is_down(const InputBinding& binding)
     return IsKeyDown(binding.primary) || IsKeyDown(binding.secondary);
 }
 
-// returns whether either key for an action was pressed this frame
-bool is_pressed(const InputBinding& binding)
-{
-    return IsKeyPressed(binding.primary) || IsKeyPressed(binding.secondary);
-}
-
-// selects one cardinal action with most-recent-key priority
-Action read_action(Action previous)
+// combines every currently held movement input
+Action read_action()
 {
     using enum Action;
 
@@ -193,38 +189,17 @@ Action read_action(Action previous)
         InputBinding{Right, KEY_D, KEY_RIGHT}
     };
 
-    const InputBinding* newly_pressed = nullptr;
-
-    for (const InputBinding& binding : BINDINGS)
-    {
-        if (is_pressed(binding))
-        {
-            newly_pressed = &binding;
-        }
-    }
-
-    if (newly_pressed != nullptr)
-    {
-        return newly_pressed->action;
-    }
-
-    for (const InputBinding& binding : BINDINGS)
-    {
-        if (binding.action == previous && is_down(binding))
-        {
-            return previous;
-        }
-    }
+    Action action = None;
 
     for (const InputBinding& binding : BINDINGS)
     {
         if (is_down(binding))
         {
-            return binding.action;
+            action = action | binding.action;
         }
     }
 
-    return None;
+    return action;
 }
 
 // calculates a zoom that fits the complete dungeon below the hud
@@ -335,6 +310,23 @@ void draw_world(const Environment& environment)
     DrawRectangleRec(shadow, PLAYER_SHADOW);
     DrawRectangleRec(player, PLAYER);
     DrawRectangleLinesEx(player, 0.08f, PLAYER_EDGE);
+}
+
+// hides world pixels beyond the player's screen-space vision radius
+void draw_vision_mask(const Environment& environment, const Camera2D& camera)
+{
+    const Vector2 center = GetWorldToScreen2D(to_raylib(environment.state().position), camera);
+    const float outer_radius = hypot(
+        static_cast<float>(GetScreenWidth()),
+        static_cast<float>(GetScreenHeight()));
+    DrawRing(
+        center,
+        VISION_RADIUS_PIXELS,
+        outer_radius,
+        0.0f,
+        360.0f,
+        VISION_MASK_SEGMENTS,
+        BACKGROUND);
 }
 
 // shrinks text only when required to fit its available width
@@ -514,14 +506,12 @@ void reset_environment(
 // runs the interactive fixed-step viewer loop
 int run(const Options& options)
 {
-    using enum Action;
     constexpr TerminationReason RUNNING = TerminationReason::None;
 
     RaylibWindow window;
     Environment environment({}, options.seed);
     uint64_t seed = options.seed;
     CameraState camera;
-    Action action = None;
     double accumulator = 0.0;
     double terminal_started = 0.0;
     uint64_t rendered_frames = 0;
@@ -534,10 +524,9 @@ int run(const Options& options)
         if (IsKeyPressed(KEY_R))
         {
             reset_environment(environment, seed, camera, accumulator, terminal_started);
-            action = None;
         }
 
-        action = read_action(action);
+        const Action action = read_action();
 
         if (environment.state().termination == RUNNING)
         {
@@ -560,7 +549,6 @@ int run(const Options& options)
         else if (now - terminal_started >= RESET_DELAY_SECONDS)
         {
             reset_environment(environment, seed, camera, accumulator, terminal_started);
-            action = None;
         }
 
         update_camera(camera, environment.dungeon());
@@ -575,6 +563,7 @@ int run(const Options& options)
         BeginMode2D(camera.camera);
         draw_world(environment);
         EndMode2D();
+        draw_vision_mask(environment, camera.camera);
         EndScissorMode();
         draw_hud(environment, seed);
         draw_terminal(environment.state().termination, terminal_remaining);

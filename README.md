@@ -6,8 +6,8 @@ The current slice is deliberately small: one square agent moves through connecte
 
 ## Rules
 
-- Actions are `up`, `down`, `left`, `right`, and `none`; there is no diagonal action.
-- Movement accelerates toward a maximum speed and brakes toward rest on `none`.
+- Actions combine `up`, `down`, `left`, and `right`, allowing diagonal movement.
+- Movement accelerates toward one shared maximum speed in every direction and brakes toward rest on `none`.
 - Eating a pellet removes it and increments the episode score.
 - The episode ends as `starved` after 15 seconds without food.
 - The episode ends as `cleared` when every pellet is eaten.
@@ -42,6 +42,8 @@ On other platforms, configure normally with CMake and set `NEUROSIM_BUILD_VIEWER
 ```
 
 Use WASD or the arrow keys to move. Press `R` to generate a new episode immediately. The viewer automatically starts a new seed shortly after a terminal state.
+
+The viewer only reveals the world within 200 pixels of the player. Unseen space uses the same background as the area outside the dungeon.
 
 The headless executable emits one JSON object per completed episode. Its built-in policy is only a deterministic smoke test, not an agent.
 
