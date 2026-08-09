@@ -26,6 +26,30 @@ float polarity_sign(NeuronPolarity polarity)
     return polarity == NeuronPolarity::Excitatory ? 1.0f : -1.0f;
 }
 
+// mixes a neuron, tick, and perturbation seed into a stable random value
+uint64_t mix_noise(uint64_t value)
+{
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31U);
+}
+
+// returns one deterministic signed perturbation drive
+float noise_drive(BrainPerturbation perturbation, uint64_t tick, uint32_t neuron)
+{
+    if (perturbation.noise_drive_amplitude == 0.0f)
+    {
+        return 0.0f;
+    }
+
+    const uint64_t keyed = perturbation.noise_seed
+        ^ ((tick + 1U) * 0xd1b54a32d192ed03ULL)
+        ^ ((static_cast<uint64_t>(neuron) + 1U) * 0x94d049bb133111ebULL);
+    const float unit = static_cast<float>(mix_noise(keyed) >> 40U) * (1.0f / 16777216.0f);
+    return (unit * 2.0f - 1.0f) * perturbation.noise_drive_amplitude;
+}
+
 }
 
 // creates a simulator with fresh state from a compiled model
@@ -64,8 +88,11 @@ void CpuBrainSimulator::reset(BrainState state)
     requires_reset_ = false;
 }
 
-// advances every neuron and connection by one fixed tick
-void CpuBrainSimulator::step(span<const float> input_drives)
+// advances every neuron and optionally records plasticity by one fixed tick
+void CpuBrainSimulator::step(
+    span<const float> input_drives,
+    BrainPerturbation perturbation,
+    bool plasticity_enabled)
 {
     if (requires_reset_)
     {
@@ -83,6 +110,12 @@ void CpuBrainSimulator::step(span<const float> input_drives)
         {
             throw invalid_argument("brain input drives must be finite");
         }
+    }
+
+    if (!finite(perturbation.noise_drive_amplitude)
+        || perturbation.noise_drive_amplitude < 0.0f)
+    {
+        throw invalid_argument("brain perturbation amplitude must be finite and nonnegative");
     }
 
     if (state_.tick == numeric_limits<uint64_t>::max())
@@ -126,7 +159,8 @@ void CpuBrainSimulator::step(span<const float> input_drives)
         const float continuous_drive = (dynamics.resting_potential - potential)
                 / dynamics.membrane_time_constant_seconds
             + model_.bias_drives[neuron]
-            + external_drive;
+            + external_drive
+            + noise_drive(perturbation, state_.tick, neuron);
         const float next_potential = potential
             + dynamics.fixed_time_step_seconds * continuous_drive
             + synaptic_drive;
@@ -149,6 +183,40 @@ void CpuBrainSimulator::step(span<const float> input_drives)
         }
     }
 
+    const PlasticityConfig& plasticity = model_.config.plasticity;
+
+    if (plasticity_enabled)
+    {
+        for (uint32_t source = 0; source < model_.positions.size(); ++source)
+        {
+            const float old_source_activity = state_.activity_traces[source];
+            const bool excitatory = model_.polarities[source] == NeuronPolarity::Excitatory;
+
+            for (uint32_t edge = model_.outgoing_offsets[source];
+                edge < model_.outgoing_offsets[source + 1U]; ++edge)
+            {
+                const uint32_t target = model_.outgoing_targets[edge];
+                const float strength = state_.connection_strengths[edge] * model_.weight_decay;
+                const float eligibility = state_.connection_eligibilities[edge]
+                        * model_.eligibility_decay
+                    + static_cast<float>(excitatory) * static_cast<float>(next_spikes_[target])
+                        * old_source_activity;
+
+                if (!finite(strength) || strength < 0.0f
+                    || !finite(eligibility) || eligibility < 0.0f)
+                {
+                    requires_reset_ = true;
+                    throw runtime_error("brain plasticity produced invalid local state");
+                }
+
+                state_.connection_strengths[edge] = strength;
+                state_.connection_eligibilities[edge] = min(
+                    plasticity.maximum_eligibility,
+                    eligibility);
+            }
+        }
+    }
+
     for (uint32_t neuron = 0; neuron < model_.positions.size(); ++neuron)
     {
         state_.activity_traces[neuron] = state_.activity_traces[neuron] * model_.trace_decay
@@ -161,31 +229,48 @@ void CpuBrainSimulator::step(span<const float> input_drives)
         }
     }
 
+    state_.spikes.swap(next_spikes_);
+    ++state_.tick;
+}
+
+// applies one signed global event to eligible local connections
+void CpuBrainSimulator::apply_plasticity_modulation(float modulator)
+{
+    if (requires_reset_)
+    {
+        throw logic_error("brain simulator must be reset after a failed numerical step");
+    }
+
+    if (!finite(modulator))
+    {
+        throw invalid_argument("brain plasticity modulator must be finite");
+    }
+
+    if (modulator == 0.0f)
+    {
+        return;
+    }
+
     const PlasticityConfig& plasticity = model_.config.plasticity;
 
     for (uint32_t source = 0; source < model_.positions.size(); ++source)
     {
-        const float source_spike = static_cast<float>(next_spikes_[source]);
-        const float source_trace = state_.activity_traces[source];
         float strength_sum = 0.0f;
 
         for (uint32_t edge = model_.outgoing_offsets[source];
             edge < model_.outgoing_offsets[source + 1U]; ++edge)
         {
-            const uint32_t target = model_.outgoing_targets[edge];
-            const float target_spike = static_cast<float>(next_spikes_[target]);
-            const float coactivity = source_spike * state_.activity_traces[target]
-                + target_spike * source_trace
-                - source_spike * target_spike;
-            const float strength = state_.connection_strengths[edge] * model_.weight_decay
-                + plasticity.learning_rate * coactivity;
+            const float delta = plasticity.learning_rate * modulator
+                * state_.connection_eligibilities[edge];
+            const float raw_strength = state_.connection_strengths[edge] + delta;
 
-            if (!finite(strength) || strength < 0.0f)
+            if (!finite(delta) || !finite(raw_strength))
             {
                 requires_reset_ = true;
-                throw runtime_error("brain plasticity produced an invalid connection strength");
+                throw runtime_error("brain modulation produced a non-finite connection strength");
             }
 
+            const float strength = max(0.0f, raw_strength);
             state_.connection_strengths[edge] = strength;
             strength_sum += strength;
         }
@@ -193,7 +278,7 @@ void CpuBrainSimulator::step(span<const float> input_drives)
         if (!finite(strength_sum))
         {
             requires_reset_ = true;
-            throw runtime_error("brain plasticity produced a non-finite outgoing strength sum");
+            throw runtime_error("brain modulation produced a non-finite outgoing strength sum");
         }
 
         if (strength_sum > plasticity.outgoing_strength_budget)
@@ -208,8 +293,7 @@ void CpuBrainSimulator::step(span<const float> input_drives)
         }
     }
 
-    state_.spikes.swap(next_spikes_);
-    ++state_.tick;
+    fill(state_.connection_eligibilities.begin(), state_.connection_eligibilities.end(), 0.0f);
 }
 
 // returns the immutable compiled model

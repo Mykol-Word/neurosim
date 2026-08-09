@@ -9,7 +9,10 @@ set(NEUROSIM_CUDA_ARCHITECTURES "all-major" CACHE STRING
     "CUDA architectures for neurosim_cuda, such as all-major or 86")
 
 add_library(neurosim_core
+    src/adaptive_controller.cpp
     src/brain.cpp
+    src/brain_agent.cpp
+    src/brain_checkpoint.cpp
     src/cpu_brain.cpp
     src/dungeon.cpp
     src/environment.cpp
@@ -28,10 +31,16 @@ endif()
 add_executable(neurosim_headless apps/headless_main.cpp)
 target_link_libraries(neurosim_headless PRIVATE neurosim_core)
 
+add_executable(neurosim_train apps/train_main.cpp)
+target_link_libraries(neurosim_train PRIVATE neurosim_core)
+target_compile_definitions(neurosim_train PRIVATE NEUROSIM_VERSION="${PROJECT_VERSION}")
+
 if(MSVC)
     target_compile_options(neurosim_headless PRIVATE /W4 /permissive- /EHsc)
+    target_compile_options(neurosim_train PRIVATE /W4 /permissive- /EHsc)
 else()
     target_compile_options(neurosim_headless PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(neurosim_train PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 if(NEUROSIM_BUILD_VIEWER)
@@ -107,16 +116,28 @@ if(BUILD_TESTING)
     add_executable(neurosim_brain_tests tests/brain_tests.cpp)
     target_link_libraries(neurosim_brain_tests PRIVATE neurosim_core)
 
+    add_executable(neurosim_agent_tests tests/agent_tests.cpp)
+    target_link_libraries(neurosim_agent_tests PRIVATE neurosim_core)
+
+    add_executable(neurosim_checkpoint_tests tests/checkpoint_tests.cpp)
+    target_link_libraries(neurosim_checkpoint_tests PRIVATE neurosim_core)
+
     if(MSVC)
         target_compile_options(neurosim_tests PRIVATE /W4 /permissive- /EHsc)
         target_compile_options(neurosim_brain_tests PRIVATE /W4 /permissive- /EHsc)
+        target_compile_options(neurosim_agent_tests PRIVATE /W4 /permissive- /EHsc)
+        target_compile_options(neurosim_checkpoint_tests PRIVATE /W4 /permissive- /EHsc)
     else()
         target_compile_options(neurosim_tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(neurosim_brain_tests PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(neurosim_agent_tests PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(neurosim_checkpoint_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
     add_test(NAME neurosim_tests COMMAND neurosim_tests)
     add_test(NAME neurosim_brain_tests COMMAND neurosim_brain_tests)
+    add_test(NAME neurosim_agent_tests COMMAND neurosim_agent_tests)
+    add_test(NAME neurosim_checkpoint_tests COMMAND neurosim_checkpoint_tests)
 
     if(NEUROSIM_BUILD_CUDA)
         add_executable(neurosim_cuda_tests tests/cuda_brain_tests.cpp)

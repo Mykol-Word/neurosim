@@ -116,6 +116,12 @@ void validate_brain_config(const BrainConfig& config)
     require(finite(plasticity.activity_trace_time_constant_seconds)
         && plasticity.activity_trace_time_constant_seconds > 0.0f,
         "activity trace time constant must be finite and positive");
+    require(finite(plasticity.eligibility_time_constant_seconds)
+        && plasticity.eligibility_time_constant_seconds > 0.0f,
+        "eligibility time constant must be finite and positive");
+    require(finite(plasticity.maximum_eligibility)
+        && plasticity.maximum_eligibility > 0.0f,
+        "maximum eligibility must be finite and positive");
     require(finite(plasticity.learning_rate) && plasticity.learning_rate >= 0.0f,
         "learning rate must be finite and nonnegative");
     require(finite(plasticity.weakening_rate_per_second)
@@ -438,6 +444,8 @@ BrainModel build_brain_model(const BrainLayout& layout, const BrainConfig& confi
 
     model.trace_decay = exp(-config.dynamics.fixed_time_step_seconds
         / config.plasticity.activity_trace_time_constant_seconds);
+    model.eligibility_decay = exp(-config.dynamics.fixed_time_step_seconds
+        / config.plasticity.eligibility_time_constant_seconds);
     model.weight_decay = exp(-config.plasticity.weakening_rate_per_second
         * config.dynamics.fixed_time_step_seconds);
     model.refractory_ticks = calculate_refractory_ticks(config.dynamics);
@@ -454,6 +462,7 @@ BrainState make_brain_state(const BrainModel& model)
     state.membrane_potentials.assign(model.positions.size(), model.config.dynamics.resting_potential);
     state.activity_traces.assign(model.positions.size(), 0.0f);
     state.connection_strengths = model.initial_connection_strengths;
+    state.connection_eligibilities.assign(model.outgoing_targets.size(), 0.0f);
     state.refractory_ticks.assign(model.positions.size(), 0U);
     state.spikes.assign(model.positions.size(), 0U);
     return state;
@@ -596,10 +605,15 @@ void validate_brain_model(const BrainModel& model)
 
     const float expected_trace_decay = exp(-model.config.dynamics.fixed_time_step_seconds
         / model.config.plasticity.activity_trace_time_constant_seconds);
+    const float expected_eligibility_decay = exp(-model.config.dynamics.fixed_time_step_seconds
+        / model.config.plasticity.eligibility_time_constant_seconds);
     const float expected_weight_decay = exp(-model.config.plasticity.weakening_rate_per_second
         * model.config.dynamics.fixed_time_step_seconds);
     require(finite(model.trace_decay) && model.trace_decay == expected_trace_decay,
         "brain trace decay is invalid");
+    require(finite(model.eligibility_decay)
+        && model.eligibility_decay == expected_eligibility_decay,
+        "brain eligibility decay is invalid");
     require(finite(model.weight_decay) && model.weight_decay == expected_weight_decay,
         "brain weight decay is invalid");
     require(model.refractory_ticks == calculate_refractory_ticks(model.config.dynamics),
@@ -617,6 +631,8 @@ void validate_brain_state(const BrainModel& model, const BrainState& state)
     require(state.activity_traces.size() == neuron_count, "brain activity trace state size is invalid");
     require(state.connection_strengths.size() == edge_count,
         "brain connection strength state size is invalid");
+    require(state.connection_eligibilities.size() == edge_count,
+        "brain connection eligibility state size is invalid");
     require(state.refractory_ticks.size() == neuron_count, "brain refractory state size is invalid");
     require(state.spikes.size() == neuron_count, "brain spike state size is invalid");
 
@@ -653,8 +669,12 @@ void validate_brain_state(const BrainModel& model, const BrainState& state)
             edge < model.outgoing_offsets[source + 1U]; ++edge)
         {
             const float strength = state.connection_strengths[edge];
+            const float eligibility = state.connection_eligibilities[edge];
             require(finite(strength) && strength >= 0.0f,
                 "brain state contains an invalid connection strength");
+            require(finite(eligibility) && eligibility >= 0.0f
+                && eligibility <= model.config.plasticity.maximum_eligibility,
+                "brain state contains an invalid connection eligibility");
             strength_sum += strength;
         }
 

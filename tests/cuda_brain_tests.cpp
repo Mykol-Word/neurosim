@@ -52,7 +52,8 @@ void check_state_parity(const BrainState& cpu, const BrainState& cuda)
         "CPU and CUDA refractory counters differ");
     check(cpu.membrane_potentials.size() == cuda.membrane_potentials.size()
         && cpu.activity_traces.size() == cuda.activity_traces.size()
-        && cpu.connection_strengths.size() == cuda.connection_strengths.size(),
+        && cpu.connection_strengths.size() == cuda.connection_strengths.size()
+        && cpu.connection_eligibilities.size() == cuda.connection_eligibilities.size(),
         "CPU and CUDA state array sizes differ");
 
     for (size_t index = 0; index < cpu.membrane_potentials.size(); ++index)
@@ -67,6 +68,8 @@ void check_state_parity(const BrainState& cpu, const BrainState& cuda)
     {
         check_near(cuda.connection_strengths[edge], cpu.connection_strengths[edge],
             "CPU and CUDA connection strengths differ");
+        check_near(cuda.connection_eligibilities[edge], cpu.connection_eligibilities[edge],
+            "CPU and CUDA connection eligibilities differ");
     }
 }
 
@@ -93,12 +96,39 @@ BrainModel make_parity_model()
     config.dynamics.membrane_time_constant_seconds = 0.020f;
     config.dynamics.refractory_period_seconds = 0.002f;
     config.plasticity.activity_trace_time_constant_seconds = 0.025f;
+    config.plasticity.eligibility_time_constant_seconds = 0.400f;
+    config.plasticity.maximum_eligibility = 2.0f;
     config.plasticity.learning_rate = 0.015f;
     config.plasticity.weakening_rate_per_second = 0.02f;
     config.plasticity.outgoing_strength_budget = 1.0f;
     config.plasticity.initial_budget_fraction = 0.8f;
     config.plasticity.initial_connection_density = 0.5f;
     return build_brain_model(layout, config, 9917);
+}
+
+// creates a two-neuron model with one hand-checkable eligible connection
+BrainModel make_modulation_model()
+{
+    BrainLayout layout;
+    layout.shape = {2, 1, 1};
+    layout.neurons = {
+        {{0, 0, 0}, NeuronPolarity::Excitatory, 0.0f},
+        {{1, 0, 0}, NeuronPolarity::Excitatory, 0.0f}
+    };
+    layout.input_positions = {{0, 0, 0}, {1, 0, 0}};
+    layout.output_positions = {{0, 0, 0}, {1, 0, 0}};
+
+    BrainConfig config;
+    config.connection_radius_steps = 1;
+    config.plasticity.activity_trace_time_constant_seconds = 0.020f;
+    config.plasticity.eligibility_time_constant_seconds = 0.500f;
+    config.plasticity.maximum_eligibility = 2.0f;
+    config.plasticity.learning_rate = 0.250f;
+    config.plasticity.weakening_rate_per_second = 0.1f;
+    config.plasticity.outgoing_strength_budget = 1.0f;
+    config.plasticity.initial_budget_fraction = 0.8f;
+    config.plasticity.initial_connection_density = 1.0f;
+    return build_brain_model(layout, config, 17);
 }
 
 // verifies dynamics, plasticity, outputs, and both reset modes across backends
@@ -126,6 +156,16 @@ void test_cpu_cuda_trajectory_parity()
         check_state_parity(cpu.state(), cuda.download_state());
     }
 
+    const BrainPerturbation perturbation{300.0f, 4821};
+
+    for (uint32_t step = 0; step < 5U; ++step)
+    {
+        const array<float, 2> input{0.0f, 0.0f};
+        cpu.step(input, perturbation);
+        cuda.step(input, perturbation);
+        check_state_parity(cpu.state(), cuda.download_state());
+    }
+
     check(cuda.output_spike(0) == cpu.output_spike(0),
         "CPU and CUDA output spike samples differ");
     check_near(cuda.output_activity(1), cpu.output_activity(1),
@@ -139,6 +179,89 @@ void test_cpu_cuda_trajectory_parity()
         "CUDA activity reset retained the tick counter");
     cuda.reset();
     check_state_parity(make_brain_state(model), cuda.download_state());
+}
+
+// verifies eligibility, signed modulation, disabled learning, and reset parity
+void test_cuda_modulated_plasticity()
+{
+    const BrainModel model = make_modulation_model();
+    CpuBrainSimulator cpu(model);
+    CudaBrainSimulator cuda(model);
+    const uint32_t source = neuron_index_at(model, {0, 0, 0});
+    const uint32_t target = neuron_index_at(model, {1, 0, 0});
+    const uint32_t edge = connection_index(model, source, target);
+    const array<float, 2> source_spike{1200.0f, 0.0f};
+    const array<float, 2> target_spike{0.0f, 1200.0f};
+
+    cpu.step(source_spike);
+    cuda.step(source_spike);
+    cpu.step(target_spike);
+    cuda.step(target_spike);
+    check_state_parity(cpu.state(), cuda.download_state());
+    const BrainState eligible_state = cpu.state();
+    check(eligible_state.connection_eligibilities[edge] > 0.0f,
+        "directed spike sequence did not create eligibility");
+
+    cpu.apply_plasticity_modulation(1.0f);
+    cuda.apply_plasticity_modulation(1.0f);
+    check_state_parity(cpu.state(), cuda.download_state());
+    const BrainState rewarded_state = cpu.state();
+    check(rewarded_state.connection_strengths[edge]
+            > eligible_state.connection_strengths[edge],
+        "positive modulation did not strengthen an eligible connection");
+    check(rewarded_state.connection_strengths[edge]
+            <= model.config.plasticity.outgoing_strength_budget,
+        "positive modulation exceeded the outgoing strength budget");
+
+    for (const float eligibility : rewarded_state.connection_eligibilities)
+    {
+        check(eligibility == 0.0f, "positive modulation did not consume eligibility");
+    }
+
+    cpu.reset(eligible_state);
+    cuda.reset(eligible_state);
+    cpu.apply_plasticity_modulation(-10.0f);
+    cuda.apply_plasticity_modulation(-10.0f);
+    check_state_parity(cpu.state(), cuda.download_state());
+    check(cpu.state().connection_strengths[edge] == 0.0f,
+        "negative modulation did not clamp an eligible connection at zero");
+
+    for (const float eligibility : cpu.state().connection_eligibilities)
+    {
+        check(eligibility == 0.0f, "negative modulation did not consume eligibility");
+    }
+
+    cpu.reset(eligible_state);
+    cuda.reset(eligible_state);
+    const vector<float> frozen_strengths = eligible_state.connection_strengths;
+    const vector<float> frozen_eligibilities = eligible_state.connection_eligibilities;
+
+    for (uint32_t step = 0; step < 3U; ++step)
+    {
+        cpu.step(target_spike, {}, false);
+        cuda.step(target_spike, {}, false);
+        check_state_parity(cpu.state(), cuda.download_state());
+    }
+
+    check(cpu.state().connection_strengths == frozen_strengths,
+        "learning-disabled CPU steps changed connection strengths");
+    check(cpu.state().connection_eligibilities == frozen_eligibilities,
+        "learning-disabled CPU steps changed connection eligibilities");
+    const BrainState before_activity_reset = cpu.state();
+    cpu.reset_activity();
+    cuda.reset_activity();
+    check_state_parity(cpu.state(), cuda.download_state());
+    check(cpu.state().connection_strengths == before_activity_reset.connection_strengths,
+        "activity reset discarded learned connection strengths");
+
+    for (const float eligibility : cpu.state().connection_eligibilities)
+    {
+        check(eligibility == 0.0f, "activity reset retained connection eligibility");
+    }
+
+    cpu.reset();
+    cuda.reset();
+    check_state_parity(cpu.state(), cuda.download_state());
 }
 
 // verifies a neuron with no possible edges runs without zero-size allocation errors
@@ -204,9 +327,10 @@ int main()
         }
 
         test_cpu_cuda_trajectory_parity();
+        test_cuda_modulated_plasticity();
         test_cuda_isolated_neuron();
         test_cuda_kernel_boundaries();
-        cout << "3 CUDA brain tests passed\n";
+        cout << "4 CUDA brain tests passed\n";
         return 0;
     }
     catch (const exception& error)

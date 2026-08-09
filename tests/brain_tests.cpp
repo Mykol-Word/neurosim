@@ -38,7 +38,7 @@ void check_near(float actual, float expected, float tolerance, const string& mes
     }
 }
 
-// returns deterministic dynamics with plasticity disabled by default
+// returns deterministic dynamics without weight changes by default
 BrainConfig make_test_config();
 
 // verifies compiled models and restored states reject internal corruption
@@ -87,6 +87,21 @@ void test_compiled_model_and_state_validation()
 
     check(decay_threw, "inconsistent derived trace decay was accepted");
 
+    BrainModel wrong_eligibility_decay = valid;
+    wrong_eligibility_decay.eligibility_decay *= 0.5f;
+    bool eligibility_decay_threw = false;
+
+    try
+    {
+        validate_brain_model(wrong_eligibility_decay);
+    }
+    catch (const invalid_argument&)
+    {
+        eligibility_decay_threw = true;
+    }
+
+    check(eligibility_decay_threw, "inconsistent eligibility decay was accepted");
+
     BrainState impossible = make_brain_state(valid);
     impossible.refractory_ticks[0] = valid.refractory_ticks + 1U;
     bool state_threw = false;
@@ -102,6 +117,22 @@ void test_compiled_model_and_state_validation()
 
     check(state_threw, "impossible refractory state was accepted");
 
+    BrainState excessive_eligibility = make_brain_state(valid);
+    excessive_eligibility.connection_eligibilities[0]
+        = valid.config.plasticity.maximum_eligibility + 0.1f;
+    bool eligibility_threw = false;
+
+    try
+    {
+        validate_brain_state(valid, excessive_eligibility);
+    }
+    catch (const invalid_argument&)
+    {
+        eligibility_threw = true;
+    }
+
+    check(eligibility_threw, "excessive connection eligibility was accepted");
+
     BrainLayout single;
     single.shape = {1, 1, 1};
     single.neurons = {{{0, 0, 0}, NeuronPolarity::Excitatory, 0.0f}};
@@ -113,12 +144,18 @@ void test_compiled_model_and_state_validation()
 }
 
 // advances a test simulator from a short stable input list
-void step_with(CpuBrainSimulator& simulator, initializer_list<float> input_drives)
+void step_with(
+    CpuBrainSimulator& simulator,
+    initializer_list<float> input_drives,
+    bool plasticity_enabled = true)
 {
-    simulator.step(span<const float>(input_drives.begin(), input_drives.size()));
+    simulator.step(
+        span<const float>(input_drives.begin(), input_drives.size()),
+        {},
+        plasticity_enabled);
 }
 
-// returns deterministic dynamics with plasticity disabled by default
+// returns deterministic dynamics without weight changes by default
 BrainConfig make_test_config()
 {
     BrainConfig config;
@@ -130,6 +167,8 @@ BrainConfig make_test_config()
     config.dynamics.firing_threshold = 1.0f;
     config.dynamics.refractory_period_seconds = 0.0f;
     config.plasticity.activity_trace_time_constant_seconds = 0.020f;
+    config.plasticity.eligibility_time_constant_seconds = 1.0f;
+    config.plasticity.maximum_eligibility = 1.0f;
     config.plasticity.learning_rate = 0.0f;
     config.plasticity.weakening_rate_per_second = 0.0f;
     config.plasticity.outgoing_strength_budget = 1.0f;
@@ -336,8 +375,90 @@ void test_inhibitory_signal_sign()
         "inhibitory connection did not subtract its strength");
 }
 
-// verifies joint activity strengthens one edge and consumes sibling budget
-void test_hebbian_strengthening_and_budget_competition()
+// verifies only earlier source activity marks the directed connection to a later target spike
+void test_causal_eligibility_direction()
+{
+    BrainLayout layout = make_pair_layout();
+    layout.input_positions.push_back({1, 0, 0});
+    const BrainModel model = build_brain_model(layout, make_test_config(), 1);
+    CpuBrainSimulator simulator(model);
+    const uint32_t source = neuron_index_at(model, {0, 0, 0});
+    const uint32_t target = neuron_index_at(model, {1, 0, 0});
+    const uint32_t forward = connection_index(model, source, target);
+    const uint32_t reverse = connection_index(model, target, source);
+
+    step_with(simulator, {1000.0f, 0.0f});
+    step_with(simulator, {0.0f, 0.0f});
+    step_with(simulator, {0.0f, 1000.0f});
+
+    check_near(simulator.state().connection_eligibilities[forward],
+        model.trace_decay, 0.000001f,
+        "causal source activity produced incorrect forward eligibility");
+    check_near(simulator.state().connection_eligibilities[reverse], 0.0f, 0.0f,
+        "causal activity incorrectly marked the reverse connection");
+    check_near(simulator.state().connection_strengths[forward], 0.0f, 0.0f,
+        "eligibility changed a connection before modulation");
+}
+
+// verifies inhibitory sources do not receive task-modulated eligibility
+void test_inhibitory_plasticity_is_fixed()
+{
+    BrainLayout layout = make_pair_layout(NeuronPolarity::Inhibitory);
+    layout.input_positions.push_back({1, 0, 0});
+    const BrainModel model = build_brain_model(layout, make_test_config(), 1);
+    CpuBrainSimulator simulator(model);
+    const uint32_t source = neuron_index_at(model, {0, 0, 0});
+    const uint32_t target = neuron_index_at(model, {1, 0, 0});
+    const uint32_t edge = connection_index(model, source, target);
+    step_with(simulator, {1000.0f, 0.0f});
+    step_with(simulator, {0.0f, 0.0f});
+    step_with(simulator, {0.0f, 1000.0f});
+    check_near(simulator.state().connection_eligibilities[edge], 0.0f, 0.0f,
+        "inhibitory source recorded task eligibility");
+}
+
+// verifies delayed positive and negative events change only eligible strengths
+void test_delayed_signed_modulation()
+{
+    BrainLayout layout = make_pair_layout();
+    layout.input_positions.push_back({1, 0, 0});
+    BrainConfig config = make_test_config();
+    config.plasticity.learning_rate = 0.2f;
+    const BrainModel model = build_brain_model(layout, config, 1);
+    const uint32_t source = neuron_index_at(model, {0, 0, 0});
+    const uint32_t target = neuron_index_at(model, {1, 0, 0});
+    const uint32_t edge = connection_index(model, source, target);
+    CpuBrainSimulator rewarded(model);
+    BrainState rewarded_state = rewarded.state();
+    rewarded_state.connection_strengths[edge] = 0.4f;
+    rewarded.reset(move(rewarded_state));
+    step_with(rewarded, {1000.0f, 0.0f});
+    step_with(rewarded, {0.0f, 1000.0f});
+    step_with(rewarded, {0.0f, 0.0f});
+    const float reward_eligibility = rewarded.state().connection_eligibilities[edge];
+    rewarded.apply_plasticity_modulation(0.5f);
+    check_near(rewarded.state().connection_strengths[edge],
+        0.4f + config.plasticity.learning_rate * 0.5f * reward_eligibility,
+        0.000001f,
+        "delayed positive modulation produced an incorrect strength");
+
+    CpuBrainSimulator punished(model);
+    BrainState punished_state = punished.state();
+    punished_state.connection_strengths[edge] = 0.4f;
+    punished.reset(move(punished_state));
+    step_with(punished, {1000.0f, 0.0f});
+    step_with(punished, {0.0f, 1000.0f});
+    step_with(punished, {0.0f, 0.0f});
+    const float punishment_eligibility = punished.state().connection_eligibilities[edge];
+    punished.apply_plasticity_modulation(-0.5f);
+    check_near(punished.state().connection_strengths[edge],
+        0.4f - config.plasticity.learning_rate * 0.5f * punishment_eligibility,
+        0.000001f,
+        "delayed negative modulation produced an incorrect strength");
+}
+
+// verifies positive modulation projects competing siblings onto one outgoing budget
+void test_modulation_budget_competition()
 {
     BrainLayout layout;
     layout.shape = {3, 1, 1};
@@ -359,26 +480,81 @@ void test_hebbian_strengthening_and_budget_competition()
     const uint32_t quiet_edge = connection_index(model, source, quiet_target);
     state.connection_strengths[active_edge] = 0.5f;
     state.connection_strengths[quiet_edge] = 0.5f;
+    state.connection_eligibilities[active_edge] = 1.0f;
     simulator.reset(move(state));
-    step_with(simulator, {1000.0f, 1000.0f, 0.0f});
+    simulator.apply_plasticity_modulation(1.0f);
 
     const float strengthened = simulator.state().connection_strengths[active_edge];
     const float weakened_sibling = simulator.state().connection_strengths[quiet_edge];
-    check(strengthened > 0.5f, "coactive connection did not strengthen");
-    check(weakened_sibling < 0.5f, "sibling connection did not yield saturated budget");
+    check(strengthened > 0.5f, "eligible connection did not strengthen");
+    check(weakened_sibling < 0.5f, "sibling connection did not yield its saturated budget");
     check_near(strengthened + weakened_sibling, 1.0f, 0.000001f,
         "outgoing budget projection produced an incorrect sum");
-
-    const uint32_t reverse_edge = connection_index(model, active_target, source);
-    check_near(simulator.state().connection_strengths[reverse_edge], 0.1f, 0.000001f,
-        "reverse connection did not learn as an independent latent edge");
 }
 
-// verifies inactivity weakens weights and decays recent activity traces
-void test_inactivity_decay()
+// verifies eligibility is bounded and consumed only by a nonzero event
+void test_bounded_and_consumed_eligibility()
 {
     BrainConfig config = make_test_config();
-    config.plasticity.weakening_rate_per_second = 2.0f;
+    config.plasticity.learning_rate = 0.1f;
+    config.plasticity.maximum_eligibility = 0.25f;
+    BrainLayout layout = make_pair_layout();
+    layout.input_positions.push_back({1, 0, 0});
+    const BrainModel model = build_brain_model(layout, config, 1);
+    CpuBrainSimulator simulator(model);
+    BrainState state = simulator.state();
+    const uint32_t source = neuron_index_at(model, {0, 0, 0});
+    const uint32_t target = neuron_index_at(model, {1, 0, 0});
+    const uint32_t edge = connection_index(model, source, target);
+    state.activity_traces[source] = 10.0f;
+    simulator.reset(move(state));
+    step_with(simulator, {0.0f, 1000.0f});
+    check_near(simulator.state().connection_eligibilities[edge], 0.25f, 0.0f,
+        "causal eligibility exceeded its configured bound");
+    simulator.apply_plasticity_modulation(0.0f);
+    check_near(simulator.state().connection_eligibilities[edge], 0.25f, 0.0f,
+        "zero modulation consumed pending eligibility");
+    simulator.apply_plasticity_modulation(1.0f);
+
+    for (const float eligibility : simulator.state().connection_eligibilities)
+    {
+        check_near(eligibility, 0.0f, 0.0f,
+            "nonzero modulation did not consume all eligibility");
+    }
+}
+
+// verifies disabled plasticity freezes strengths and eligibility while activity advances
+void test_disabled_plasticity_freezes_local_state()
+{
+    BrainLayout layout = make_pair_layout();
+    layout.input_positions.push_back({1, 0, 0});
+    BrainConfig config = make_test_config();
+    config.plasticity.weakening_rate_per_second = 1.0f;
+    const BrainModel model = build_brain_model(layout, config, 1);
+    CpuBrainSimulator simulator(model);
+    BrainState state = simulator.state();
+    const uint32_t source = neuron_index_at(model, {0, 0, 0});
+    const uint32_t target = neuron_index_at(model, {1, 0, 0});
+    const uint32_t edge = connection_index(model, source, target);
+    state.connection_strengths[edge] = 0.5f;
+    state.connection_eligibilities[edge] = 0.4f;
+    state.activity_traces[source] = 1.0f;
+    simulator.reset(move(state));
+    step_with(simulator, {0.0f, 1000.0f}, false);
+    check_near(simulator.state().connection_strengths[edge], 0.5f, 0.0f,
+        "disabled plasticity decayed a connection strength");
+    check_near(simulator.state().connection_eligibilities[edge], 0.4f, 0.0f,
+        "disabled plasticity changed connection eligibility");
+    check(simulator.state().tick == 1U && simulator.state().activity_traces[target] == 1.0f,
+        "disabled plasticity also stopped neuron activity");
+}
+
+// verifies the default passive weakening preserves unused paths over short runs
+void test_slow_passive_strength_decay()
+{
+    BrainConfig config;
+    config.plasticity.initial_budget_fraction = 0.0f;
+    config.plasticity.initial_connection_density = 0.0f;
     const BrainModel model = build_brain_model(make_pair_layout(), config, 1);
     CpuBrainSimulator simulator(model);
     BrainState state = simulator.state();
@@ -386,13 +562,18 @@ void test_inactivity_decay()
     const uint32_t target = neuron_index_at(model, {1, 0, 0});
     const uint32_t edge = connection_index(model, source, target);
     state.connection_strengths[edge] = 0.5f;
-    state.activity_traces[source] = 1.0f;
     simulator.reset(move(state));
-    step_with(simulator, {0.0f});
-    check_near(simulator.state().connection_strengths[edge], 0.5f * model.weight_decay, 0.000001f,
-        "inactive connection did not use the configured weakening rate");
-    check_near(simulator.state().activity_traces[source], model.trace_decay, 0.000001f,
-        "inactive activity trace did not decay");
+
+    for (uint32_t tick = 0; tick < 1000U; ++tick)
+    {
+        step_with(simulator, {0.0f});
+    }
+
+    const float expected = 0.5f * pow(model.weight_decay, 1000.0f);
+    check_near(simulator.state().connection_strengths[edge], expected, 0.00001f,
+        "passive connection weakening did not use the configured rate");
+    check(simulator.state().connection_strengths[edge] > 0.499f,
+        "default passive weakening erased an unused path too quickly");
 }
 
 // verifies activity-only and full reset preserve different state intentionally
@@ -404,8 +585,9 @@ void test_reset_modes_and_replay()
     layout.input_positions.push_back({1, 0, 0});
     const BrainModel model = build_brain_model(layout, config, 1);
     CpuBrainSimulator simulator(model);
-    step_with(simulator, {1000.0f, 1000.0f});
-    step_with(simulator, {0.0f, 0.0f});
+    step_with(simulator, {1000.0f, 0.0f});
+    step_with(simulator, {0.0f, 1000.0f});
+    simulator.apply_plasticity_modulation(1.0f);
     const BrainState replay_state = simulator.state();
     const uint32_t edge = connection_index(model,
         neuron_index_at(model, {0, 0, 0}), neuron_index_at(model, {1, 0, 0}));
@@ -413,23 +595,30 @@ void test_reset_modes_and_replay()
     check(learned_strength > model.initial_connection_strengths[edge],
         "reset fixture did not learn a connection before reset");
 
+    BrainState eligible_state = replay_state;
+    eligible_state.connection_eligibilities[edge] = 0.25f;
+    simulator.reset(move(eligible_state));
+
     simulator.reset_activity();
     check_near(simulator.state().connection_strengths[edge], learned_strength, 0.0f,
         "activity reset discarded learned strength");
     check(simulator.state().tick == 0U
         && simulator.state().spikes[0] == 0U
-        && simulator.state().activity_traces[0] == 0.0f,
-        "activity reset retained transient neuron state");
+        && simulator.state().activity_traces[0] == 0.0f
+        && simulator.state().connection_eligibilities[edge] == 0.0f,
+        "activity reset retained transient neuron or eligibility state");
 
     simulator.reset();
     check_near(simulator.state().connection_strengths[edge],
         model.initial_connection_strengths[edge], 0.0f,
         "full reset did not restore initial strength");
-    step_with(simulator, {1000.0f, 1000.0f});
-    step_with(simulator, {0.0f, 0.0f});
+    step_with(simulator, {1000.0f, 0.0f});
+    step_with(simulator, {0.0f, 1000.0f});
+    simulator.apply_plasticity_modulation(1.0f);
     check(simulator.state().membrane_potentials == replay_state.membrane_potentials
         && simulator.state().activity_traces == replay_state.activity_traces
         && simulator.state().connection_strengths == replay_state.connection_strengths
+        && simulator.state().connection_eligibilities == replay_state.connection_eligibilities
         && simulator.state().refractory_ticks == replay_state.refractory_ticks
         && simulator.state().spikes == replay_state.spikes
         && simulator.state().tick == replay_state.tick,
@@ -469,6 +658,21 @@ void test_invalid_boundaries_fail_loudly()
 
     check(config_threw, "unstable brain time step was accepted");
 
+    BrainConfig invalid_plasticity = make_test_config();
+    invalid_plasticity.plasticity.eligibility_time_constant_seconds = 0.0f;
+    bool plasticity_threw = false;
+
+    try
+    {
+        build_brain_model(make_pair_layout(), invalid_plasticity, 1);
+    }
+    catch (const invalid_argument&)
+    {
+        plasticity_threw = true;
+    }
+
+    check(plasticity_threw, "invalid eligibility time constant was accepted");
+
     CpuBrainSimulator simulator(build_brain_model(make_pair_layout(), make_test_config(), 1));
     const BrainState before = simulator.state();
     bool input_threw = false;
@@ -499,6 +703,22 @@ void test_invalid_boundaries_fail_loudly()
 
     check(count_threw && simulator.state().tick == before.tick,
         "incorrect input count did not fail before mutating brain state");
+
+    bool modulator_threw = false;
+
+    try
+    {
+        simulator.apply_plasticity_modulation(numeric_limits<float>::quiet_NaN());
+    }
+    catch (const invalid_argument&)
+    {
+        modulator_threw = true;
+    }
+
+    check(modulator_threw
+        && simulator.state().connection_strengths == before.connection_strengths
+        && simulator.state().connection_eligibilities == before.connection_eligibilities,
+        "non-finite modulation mutated brain plasticity state");
 
     BrainLayout overflow_layout;
     overflow_layout.shape = {1, 1, 1};
@@ -535,6 +755,44 @@ void test_invalid_boundaries_fail_loudly()
     overflow_simulator.reset();
 }
 
+// verifies perturbation is reproducible and invalid values fail before mutation
+void test_deterministic_global_perturbation()
+{
+    BrainLayout layout;
+    layout.shape = {1, 1, 1};
+    layout.neurons = {{{0, 0, 0}, NeuronPolarity::Excitatory, 0.0f}};
+    BrainConfig config = make_test_config();
+    config.dynamics.firing_threshold = 10.0f;
+    const BrainModel model = build_brain_model(layout, config, 1);
+    CpuBrainSimulator first(model);
+    CpuBrainSimulator repeated(model);
+    CpuBrainSimulator different(model);
+    const BrainPerturbation perturbation{100.0f, 19};
+    first.step({}, perturbation);
+    repeated.step({}, perturbation);
+    different.step({}, {100.0f, 20});
+    check(first.state().membrane_potentials == repeated.state().membrane_potentials,
+        "same perturbation seed did not reproduce neuron state");
+    check(first.state().membrane_potentials != different.state().membrane_potentials,
+        "different perturbation seeds produced identical neuron state");
+
+    const BrainState before = first.state();
+    bool threw = false;
+
+    try
+    {
+        first.step({}, {numeric_limits<float>::quiet_NaN(), 1});
+    }
+    catch (const invalid_argument&)
+    {
+        threw = true;
+    }
+
+    check(threw && first.state().tick == before.tick
+        && first.state().membrane_potentials == before.membrane_potentials,
+        "invalid perturbation mutated brain state");
+}
+
 }
 
 // runs every brain model test and reports failures through the exit code
@@ -548,11 +806,17 @@ int main()
         {"threshold_reset_and_refractory", test_threshold_reset_and_refractory},
         {"one_tick_signal_delay", test_one_tick_signal_delay},
         {"inhibitory_signal_sign", test_inhibitory_signal_sign},
-        {"hebbian_strengthening_and_budget_competition", test_hebbian_strengthening_and_budget_competition},
-        {"inactivity_decay", test_inactivity_decay},
+        {"causal_eligibility_direction", test_causal_eligibility_direction},
+        {"inhibitory_plasticity_is_fixed", test_inhibitory_plasticity_is_fixed},
+        {"delayed_signed_modulation", test_delayed_signed_modulation},
+        {"modulation_budget_competition", test_modulation_budget_competition},
+        {"bounded_and_consumed_eligibility", test_bounded_and_consumed_eligibility},
+        {"disabled_plasticity_freezes_local_state", test_disabled_plasticity_freezes_local_state},
+        {"slow_passive_strength_decay", test_slow_passive_strength_decay},
         {"reset_modes_and_replay", test_reset_modes_and_replay},
         {"compiled_model_and_state_validation", test_compiled_model_and_state_validation},
-        {"invalid_boundaries_fail_loudly", test_invalid_boundaries_fail_loudly}
+        {"invalid_boundaries_fail_loudly", test_invalid_boundaries_fail_loudly},
+        {"deterministic_global_perturbation", test_deterministic_global_perturbation}
     };
     size_t failures = 0;
 

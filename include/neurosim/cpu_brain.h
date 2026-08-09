@@ -27,8 +27,14 @@ public:
     // replaces the complete mutable state after validating it
     void reset(BrainState state);
 
-    // advances every neuron and connection by one fixed tick
-    void step(span<const float> input_drives);
+    // advances every neuron and optionally records plasticity by one fixed tick
+    void step(
+        span<const float> input_drives,
+        BrainPerturbation perturbation = {},
+        bool plasticity_enabled = true);
+
+    // applies one signed global event to eligible local connections
+    void apply_plasticity_modulation(float modulator);
 
     // returns the immutable compiled model
     const BrainModel& model() const;

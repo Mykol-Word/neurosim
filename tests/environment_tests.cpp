@@ -113,6 +113,41 @@ void test_generation_is_deterministic_and_varied()
     check(minimum_room_count < maximum_room_count, "generator did not vary room counts across sampled seeds");
 }
 
+// verifies dense default pellet placement remains bounded and reliable across seeds
+void test_default_pellet_density()
+{
+    const DungeonConfig config;
+    check(config.min_pellets_per_room == 4U, "default minimum pellet density is incorrect");
+    check(config.max_pellets_per_room == 8U, "default maximum pellet density is incorrect");
+
+    const float spacing_squared = config.pellet_min_spacing * config.pellet_min_spacing;
+    const float spawn_clearance_squared = config.spawn_clearance * config.spawn_clearance;
+
+    for (uint64_t seed = 1; seed <= 2'048U; ++seed)
+    {
+        const Dungeon dungeon = generate_dungeon(config, 1.4f, seed);
+        const size_t minimum = dungeon.rooms.size() * config.min_pellets_per_room;
+        const size_t maximum = dungeon.rooms.size() * config.max_pellets_per_room;
+        check(dungeon.pellets.size() >= minimum && dungeon.pellets.size() <= maximum,
+            "generated pellet count fell outside the configured per-room range");
+
+        for (size_t pellet = 0; pellet < dungeon.pellets.size(); ++pellet)
+        {
+            check(distance_squared(dungeon.pellets[pellet].position, dungeon.spawn)
+                    >= spawn_clearance_squared,
+                "generated pellet violated spawn clearance");
+
+            for (size_t previous = 0; previous < pellet; ++previous)
+            {
+                check(distance_squared(
+                        dungeon.pellets[pellet].position,
+                        dungeon.pellets[previous].position) >= spacing_squared,
+                    "generated pellets violated minimum spacing");
+            }
+        }
+    }
+}
+
 // verifies acceleration, maximum speed, and idle braking
 void test_acceleration_speed_cap_and_braking()
 {
@@ -352,6 +387,21 @@ void test_invalid_configuration_fails_loudly()
     }
 
     check(threw, "invalid player and corridor clearance was accepted");
+
+    config = make_test_config();
+    config.vision_radius = 0.0f;
+    threw = false;
+
+    try
+    {
+        Environment environment(config, 1);
+    }
+    catch (const invalid_argument&)
+    {
+        threw = true;
+    }
+
+    check(threw, "invalid vision radius was accepted");
 }
 
 }
@@ -361,6 +411,7 @@ int main()
 {
     const vector<pair<const char*, function<void()>>> tests{
         {"generation_is_deterministic_and_varied", test_generation_is_deterministic_and_varied},
+        {"default_pellet_density", test_default_pellet_density},
         {"default_speed_limit", test_default_speed_limit},
         {"acceleration_speed_cap_and_braking", test_acceleration_speed_cap_and_braking},
         {"combined_movement_respects_speed_limit", test_combined_movement_respects_speed_limit},

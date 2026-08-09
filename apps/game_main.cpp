@@ -1,4 +1,5 @@
-#include "neurosim/environment.h"
+#include "neurosim/brain_agent.h"
+#include "neurosim/brain_checkpoint.h"
 
 #include <raylib.h>
 
@@ -9,7 +10,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -25,7 +28,6 @@ constexpr int INITIAL_HEIGHT = 800;
 constexpr int MINIMUM_WIDTH = 800;
 constexpr int MINIMUM_HEIGHT = 500;
 constexpr int HUD_HEIGHT = 76;
-constexpr float VIEW_PADDING = 28.0f;
 constexpr float VISION_RADIUS_PIXELS = 200.0f;
 constexpr int VISION_MASK_SEGMENTS = 128;
 constexpr float RESET_DELAY_SECONDS = 2.0f;
@@ -39,6 +41,7 @@ constexpr Color PELLET_CORE{255, 224, 147, 255};
 constexpr Color PLAYER_SHADOW{8, 10, 12, 150};
 constexpr Color PLAYER{87, 205, 181, 255};
 constexpr Color PLAYER_EDGE{184, 246, 230, 255};
+constexpr Color PLAYER_EXPLORE{225, 105, 104, 255};
 constexpr Color HUD_BACKGROUND{21, 25, 30, 255};
 constexpr Color HUD_DIVIDER{53, 60, 67, 255};
 constexpr Color LABEL_TEXT{143, 153, 162, 255};
@@ -48,8 +51,14 @@ constexpr Color VALUE_TEXT{231, 235, 238, 255};
 struct Options
 {
     uint64_t seed = 1;
+    uint64_t brain_seed = 1;
     string capture_path;
+    filesystem::path load_brain_path;
     uint64_t exit_after_frames = 0;
+    bool brain_control = false;
+    bool brain_seed_explicit = false;
+    bool learning_enabled = true;
+    bool learning_explicit = false;
 };
 
 // maps one environment action to two keyboard keys
@@ -129,6 +138,26 @@ Options parse_options(int argc, char** argv)
         {
             options.seed = parse_unsigned(argv[++index], "invalid --seed value");
         }
+        else if (argument == "--brain")
+        {
+            options.brain_control = true;
+        }
+        else if (argument == "--brain-seed" && index + 1 < argc)
+        {
+            options.brain_seed = parse_unsigned(argv[++index], "invalid --brain-seed value");
+            options.brain_seed_explicit = true;
+        }
+        else if (argument == "--load-brain" && index + 1 < argc)
+        {
+            options.load_brain_path = argv[++index];
+            options.brain_control = true;
+        }
+        else if (argument == "--learn")
+        {
+            options.brain_control = true;
+            options.learning_enabled = true;
+            options.learning_explicit = true;
+        }
         else if (argument == "--capture" && index + 1 < argc)
         {
             options.capture_path = argv[++index];
@@ -152,8 +181,15 @@ Options parse_options(int argc, char** argv)
         else
         {
             throw invalid_argument(
-                "usage: neurosim_game [--seed N] [--capture PATH] [--exit-after-frames N]");
+                "usage: neurosim_game [--seed N] [--brain] [--brain-seed N] "
+                "[--load-brain PATH] [--learn] [--capture PATH] "
+                "[--exit-after-frames N]");
         }
+    }
+
+    if (!options.load_brain_path.empty() && !options.learning_explicit)
+    {
+        options.learning_enabled = false;
     }
 
     return options;
@@ -202,20 +238,8 @@ Action read_action()
     return action;
 }
 
-// calculates a zoom that fits the complete dungeon below the hud
-float fitted_zoom(const Dungeon& dungeon, int screen_width, int screen_height)
-{
-    const float available_width = max(1.0f, static_cast<float>(screen_width) - VIEW_PADDING * 2.0f);
-    const float available_height = max(
-        1.0f,
-        static_cast<float>(screen_height - HUD_HEIGHT) - VIEW_PADDING * 2.0f);
-    const float world_width = max(1.0f, dungeon.bounds.width() + 4.0f);
-    const float world_height = max(1.0f, dungeon.bounds.height() + 4.0f);
-    return clamp(min(available_width / world_width, available_height / world_height), 0.05f, 32.0f);
-}
-
-// updates camera fitting and mouse-wheel zoom for the current window
-void update_camera(CameraState& state, const Dungeon& dungeon)
+// follows the player while preserving the configured default vision size
+void update_camera(CameraState& state, const Environment& environment)
 {
     const int screen_width = GetScreenWidth();
     const int screen_height = GetScreenHeight();
@@ -229,13 +253,15 @@ void update_camera(CameraState& state, const Dungeon& dungeon)
             5.0f);
     }
 
-    state.camera.target = to_raylib(dungeon.bounds.center());
+    state.camera.target = to_raylib(environment.state().position);
     state.camera.offset = {
         static_cast<float>(screen_width) * 0.5f,
         static_cast<float>(HUD_HEIGHT) + static_cast<float>(screen_height - HUD_HEIGHT) * 0.5f
     };
     state.camera.rotation = 0.0f;
-    state.camera.zoom = fitted_zoom(dungeon, screen_width, screen_height) * state.zoom_multiplier;
+    state.camera.zoom = VISION_RADIUS_PIXELS
+        / environment.config().vision_radius
+        * state.zoom_multiplier;
 }
 
 // formats seconds as a minute-second stopwatch value
@@ -265,7 +291,7 @@ string format_food_time(double seconds, double limit)
 }
 
 // renders dungeon geometry, live pellets, and the player
-void draw_world(const Environment& environment)
+void draw_world(const Environment& environment, bool exploring)
 {
     const Dungeon& dungeon = environment.dungeon();
 
@@ -308,11 +334,11 @@ void draw_world(const Environment& environment)
     shadow.x += 0.12f;
     shadow.y += 0.14f;
     DrawRectangleRec(shadow, PLAYER_SHADOW);
-    DrawRectangleRec(player, PLAYER);
+    DrawRectangleRec(player, exploring ? PLAYER_EXPLORE : PLAYER);
     DrawRectangleLinesEx(player, 0.08f, PLAYER_EDGE);
 }
 
-// hides world pixels beyond the player's screen-space vision radius
+// hides world pixels beyond the configured world-space vision radius
 void draw_vision_mask(const Environment& environment, const Camera2D& camera)
 {
     const Vector2 center = GetWorldToScreen2D(to_raylib(environment.state().position), camera);
@@ -321,7 +347,7 @@ void draw_vision_mask(const Environment& environment, const Camera2D& camera)
         static_cast<float>(GetScreenHeight()));
     DrawRing(
         center,
-        VISION_RADIUS_PIXELS,
+        environment.config().vision_radius * camera.zoom,
         outer_radius,
         0.0f,
         360.0f,
@@ -351,24 +377,31 @@ void draw_text_centered(const string& text, float center_x, float y, float size,
     DrawTextEx(font, text.c_str(), {center_x - dimensions.x * 0.5f, y}, size, 0.0f, color);
 }
 
-// renders the live score and stopwatch hud
-void draw_hud(const Environment& environment, uint64_t seed)
+// renders the live score, stopwatches, and controller state
+void draw_hud(const Environment& environment, uint64_t seed, const BrainAgent* agent)
 {
     const int screen_width = GetScreenWidth();
-    const float column_width = static_cast<float>(screen_width) / 5.0f;
+    const float column_width = static_cast<float>(screen_width) / 6.0f;
     const EnvironmentState& state = environment.state();
-    const array<const char*, 5> labels{
+    const array<const char*, 6> labels{
         "SCORE",
         "REMAINING",
         "RUN TIME",
         "SINCE FOOD",
+        "CONTROL",
         "SEED"
     };
-    const array<string, 5> values{
+    const string control = agent == nullptr
+        ? "PLAYER"
+        : agent->status().exploring
+            ? "EXPLORE"
+            : agent->learning_enabled() ? "BRAIN" : "FROZEN";
+    const array<string, 6> values{
         to_string(state.score),
         to_string(state.pellets_remaining),
         format_clock(environment.elapsed_seconds()),
         format_food_time(environment.seconds_since_food(), environment.config().starvation_seconds),
+        control,
         to_string(seed)
     };
 
@@ -491,6 +524,7 @@ void draw_terminal(TerminationReason reason, double seconds_remaining)
 // advances to a fresh seed and clears viewer timing state
 void reset_environment(
     Environment& environment,
+    BrainAgent* agent,
     uint64_t& seed,
     CameraState& camera,
     double& accumulator,
@@ -498,6 +532,12 @@ void reset_environment(
 {
     ++seed;
     environment.reset(seed);
+
+    if (agent != nullptr)
+    {
+        agent->reset_episode(seed);
+    }
+
     camera.zoom_multiplier = 1.0f;
     accumulator = 0.0;
     terminal_started = 0.0;
@@ -508,8 +548,41 @@ int run(const Options& options)
 {
     constexpr TerminationReason RUNNING = TerminationReason::None;
 
+    optional<BrainCheckpoint> checkpoint;
+    uint64_t brain_seed = options.brain_seed;
+
+    if (!options.load_brain_path.empty())
+    {
+        checkpoint = load_brain_checkpoint(options.load_brain_path);
+
+        if (options.brain_seed_explicit && brain_seed != checkpoint->brain_seed)
+        {
+            throw invalid_argument("--brain-seed does not match the loaded checkpoint");
+        }
+
+        brain_seed = checkpoint->brain_seed;
+    }
+
     RaylibWindow window;
     Environment environment({}, options.seed);
+    optional<BrainAgent> brain_agent;
+
+    if (options.brain_control)
+    {
+        brain_agent.emplace(environment.config(), BrainAgentConfig{}, brain_seed);
+
+        if (checkpoint)
+        {
+            validate_brain_checkpoint(*checkpoint, brain_agent->seed(), brain_agent->simulator().model());
+            brain_agent->load_connection_strengths(checkpoint->connection_strengths);
+        }
+
+        brain_agent->set_learning_enabled(options.learning_enabled);
+        brain_agent->set_exploration_enabled(options.learning_enabled);
+        brain_agent->reset_episode(options.seed);
+    }
+
+    BrainAgent* agent = brain_agent ? &*brain_agent : nullptr;
     uint64_t seed = options.seed;
     CameraState camera;
     double accumulator = 0.0;
@@ -523,10 +596,10 @@ int run(const Options& options)
 
         if (IsKeyPressed(KEY_R))
         {
-            reset_environment(environment, seed, camera, accumulator, terminal_started);
+            reset_environment(environment, agent, seed, camera, accumulator, terminal_started);
         }
 
-        const Action action = read_action();
+        const Action keyboard_action = read_action();
 
         if (environment.state().termination == RUNNING)
         {
@@ -535,7 +608,16 @@ int run(const Options& options)
 
             while (accumulator >= fixed_time_step)
             {
-                environment.step(action);
+                const Action action = agent == nullptr
+                    ? keyboard_action
+                    : agent->decide(environment);
+                const StepResult transition = environment.step(action);
+
+                if (agent != nullptr)
+                {
+                    agent->observe_transition(transition);
+                }
+
                 accumulator -= fixed_time_step;
 
                 if (environment.state().termination != RUNNING)
@@ -548,10 +630,10 @@ int run(const Options& options)
         }
         else if (now - terminal_started >= RESET_DELAY_SECONDS)
         {
-            reset_environment(environment, seed, camera, accumulator, terminal_started);
+            reset_environment(environment, agent, seed, camera, accumulator, terminal_started);
         }
 
-        update_camera(camera, environment.dungeon());
+        update_camera(camera, environment);
         const double terminal_remaining = RESET_DELAY_SECONDS - (now - terminal_started);
         const bool capture_this_frame = !captured
             && !options.capture_path.empty()
@@ -561,11 +643,13 @@ int run(const Options& options)
         ClearBackground(BACKGROUND);
         BeginScissorMode(0, HUD_HEIGHT, GetScreenWidth(), GetScreenHeight() - HUD_HEIGHT);
         BeginMode2D(camera.camera);
-        draw_world(environment);
+        draw_world(
+            environment,
+            agent != nullptr && agent->status().exploring);
         EndMode2D();
         draw_vision_mask(environment, camera.camera);
         EndScissorMode();
-        draw_hud(environment, seed);
+        draw_hud(environment, seed, agent);
         draw_terminal(environment.state().termination, terminal_remaining);
 
         EndDrawing();

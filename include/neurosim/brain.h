@@ -68,8 +68,10 @@ struct NeuronDynamicsConfig
 struct PlasticityConfig
 {
     float activity_trace_time_constant_seconds = 0.020f;
-    float learning_rate = 0.010f;
-    float weakening_rate_per_second = 0.010f;
+    float eligibility_time_constant_seconds = 1.0f;
+    float maximum_eligibility = 1.0f;
+    float learning_rate = 0.050f;
+    float weakening_rate_per_second = 0.0001f;
     float outgoing_strength_budget = 1.0f;
     float initial_budget_fraction = 1.0f;
     float initial_connection_density = 0.25f;
@@ -81,6 +83,13 @@ struct BrainConfig
     uint32_t connection_radius_steps = 2;
     NeuronDynamicsConfig dynamics;
     PlasticityConfig plasticity;
+};
+
+// configures deterministic signed noise applied independently to every neuron
+struct BrainPerturbation
+{
+    float noise_drive_amplitude = 0.0f;
+    uint64_t noise_seed = 0;
 };
 
 // stores immutable compiled topology and initial connection strengths
@@ -103,6 +112,7 @@ struct BrainModel
     vector<uint32_t> output_neurons;
     vector<float> initial_connection_strengths;
     float trace_decay = 0.0f;
+    float eligibility_decay = 0.0f;
     float weight_decay = 0.0f;
     uint32_t refractory_ticks = 0;
 };
@@ -113,6 +123,7 @@ struct BrainState
     vector<float> membrane_potentials;
     vector<float> activity_traces;
     vector<float> connection_strengths;
+    vector<float> connection_eligibilities;
     vector<uint32_t> refractory_ticks;
     vector<uint8_t> spikes;
     uint64_t tick = 0;

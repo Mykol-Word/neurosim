@@ -34,10 +34,10 @@ struct DungeonConfig
     float max_corridor_width = 8.0f;
     float extra_connection_ratio = 0.25f;
     float two_bend_chance = 0.35f;
-    uint32_t min_pellets_per_room = 1;
-    uint32_t max_pellets_per_room = 4;
+    uint32_t min_pellets_per_room = 4;
+    uint32_t max_pellets_per_room = 8;
     float pellet_min_spacing = 3.0f;
-    float spawn_clearance = 5.0f;
+    float spawn_clearance = 3.5f;
     uint32_t placement_attempts_per_room = 300;
     uint32_t pellet_placement_attempts = 200;
 };
@@ -90,4 +90,3 @@ Dungeon generate_dungeon(const DungeonConfig& config, float player_size, uint64_
 bool is_navigable(const Dungeon& dungeon, Vec2 position, float player_size);
 
 }
-

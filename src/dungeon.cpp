@@ -421,7 +421,9 @@ void place_pellets(Dungeon& dungeon, const DungeonConfig& config, float player_s
 
         for (uint32_t pellet_index = 0; pellet_index < pellet_count; ++pellet_index)
         {
-            bool placed = false;
+            bool found_candidate = false;
+            Vec2 best_position;
+            float best_clearance_squared = -1.0f;
 
             for (uint32_t attempt = 0; attempt < config.pellet_placement_attempts; ++attempt)
             {
@@ -443,31 +445,29 @@ void place_pellets(Dungeon& dungeon, const DungeonConfig& config, float player_s
                     continue;
                 }
 
-                bool too_close = false;
+                float clearance_squared = numeric_limits<float>::infinity();
 
                 for (const Pellet& pellet : dungeon.pellets)
                 {
-                    if (distance_squared(position, pellet.position) < minimum_spacing_squared)
-                    {
-                        too_close = true;
-                        break;
-                    }
+                    clearance_squared = min(
+                        clearance_squared,
+                        distance_squared(position, pellet.position));
                 }
 
-                if (too_close)
+                if (!found_candidate || clearance_squared > best_clearance_squared)
                 {
-                    continue;
+                    found_candidate = true;
+                    best_position = position;
+                    best_clearance_squared = clearance_squared;
                 }
-
-                dungeon.pellets.push_back({position});
-                placed = true;
-                break;
             }
 
-            if (!placed)
+            if (!found_candidate || best_clearance_squared < minimum_spacing_squared)
             {
                 throw runtime_error("failed to place dungeon pellet with the requested clearances");
             }
+
+            dungeon.pellets.push_back({best_position});
         }
     }
 }

@@ -31,6 +31,11 @@ void validate_environment_config(const EnvironmentConfig& config)
         throw invalid_argument("fixed time step must be finite and positive");
     }
 
+    if (!isfinite(config.vision_radius) || config.vision_radius <= 0.0f)
+    {
+        throw invalid_argument("vision radius must be finite and positive");
+    }
+
     if (!isfinite(config.acceleration) || config.acceleration <= 0.0f)
     {
         throw invalid_argument("acceleration must be finite and positive");
@@ -142,8 +147,7 @@ float resolve_axis(
         const float cross_minimum = horizontal ? navigable.min_y : navigable.min_x;
         const float cross_maximum = horizontal ? navigable.max_y : navigable.max_x;
 
-        if (cross_axis < cross_minimum - NAVIGATION_EPSILON
-            || cross_axis > cross_maximum + NAVIGATION_EPSILON)
+        if (cross_axis < cross_minimum || cross_axis > cross_maximum)
         {
             continue;
         }
@@ -163,7 +167,7 @@ float resolve_axis(
 
     for (const Interval interval : intervals)
     {
-        if (merged.empty() || interval.minimum > merged.back().maximum + NAVIGATION_EPSILON)
+        if (merged.empty() || interval.minimum > merged.back().maximum)
         {
             merged.push_back(interval);
         }
@@ -177,14 +181,13 @@ float resolve_axis(
 
     for (const Interval interval : merged)
     {
-        if (current_axis < interval.minimum - NAVIGATION_EPSILON
-            || current_axis > interval.maximum + NAVIGATION_EPSILON)
+        if (current_axis < interval.minimum || current_axis > interval.maximum)
         {
             continue;
         }
 
         const float result = clamp(target, interval.minimum, interval.maximum);
-        blocked = abs(result - target) > NAVIGATION_EPSILON;
+        blocked = result != target;
         return result;
     }
 
@@ -318,6 +321,7 @@ StepResult Environment::step(Action action)
 
     return {
         eaten,
+        blocked_x || blocked_y,
         state_.score,
         state_.pellets_remaining,
         elapsed_seconds(),

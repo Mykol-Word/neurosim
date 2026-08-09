@@ -21,6 +21,30 @@ namespace
 
 inline constexpr uint32_t CUDA_THREADS_PER_BLOCK = 256U;
 
+// mixes a neuron, tick, and perturbation seed into a stable random value
+__device__ uint64_t mix_noise(uint64_t value)
+{
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31U);
+}
+
+// returns one deterministic signed perturbation drive
+__device__ float noise_drive(float amplitude, uint64_t seed, uint64_t tick, uint32_t neuron)
+{
+    if (amplitude == 0.0f)
+    {
+        return 0.0f;
+    }
+
+    const uint64_t keyed = seed
+        ^ ((tick + 1U) * 0xd1b54a32d192ed03ULL)
+        ^ ((static_cast<uint64_t>(neuron) + 1U) * 0x94d049bb133111ebULL);
+    const float unit = static_cast<float>(mix_noise(keyed) >> 40U) * (1.0f / 16777216.0f);
+    return (unit * 2.0f - 1.0f) * amplitude;
+}
+
 // throws a contextual error when a cuda runtime call fails
 void check_cuda(cudaError_t result, const char* operation)
 {
@@ -180,8 +204,10 @@ struct DeviceBrainConfig
     float reset_potential;
     float firing_threshold;
     float trace_decay;
+    float eligibility_decay;
     float weight_decay;
     float learning_rate;
+    float maximum_eligibility;
     float outgoing_strength_budget;
     uint32_t refractory_ticks;
 };
@@ -200,9 +226,11 @@ __global__ void advance_neurons_kernel(
     const uint8_t* previous_spikes,
     uint8_t* next_spikes,
     float* membrane_potentials,
-    float* activity_traces,
     uint32_t* refractory_ticks,
     int32_t* error_flag,
+    uint64_t tick,
+    uint64_t noise_seed,
+    float noise_amplitude,
     DeviceBrainConfig config)
 {
     const uint32_t neuron = blockIdx.x * blockDim.x + threadIdx.x;
@@ -245,7 +273,8 @@ __global__ void advance_neurons_kernel(
         const float continuous_drive = (config.resting_potential - potential)
                 / config.membrane_time_constant_seconds
             + bias_drives[neuron]
-            + external_drive;
+            + external_drive
+            + noise_drive(noise_amplitude, noise_seed, tick, neuron);
         const float next_potential = potential
             + config.fixed_time_step_seconds * continuous_drive
             + synaptic_drive;
@@ -267,24 +296,20 @@ __global__ void advance_neurons_kernel(
     }
 
     next_spikes[neuron] = spike;
-    const float trace = activity_traces[neuron] * config.trace_decay + static_cast<float>(spike);
-    activity_traces[neuron] = trace;
-
-    if (!isfinite(trace))
-    {
-        atomicCAS(error_flag, 0, 2);
-    }
 }
 
-// updates one source-owned outgoing range and projects it onto its budget
-__global__ void update_connections_kernel(
+// updates one source-owned eligibility range and its source activity trace
+__global__ void update_plasticity_and_traces_kernel(
     uint32_t neuron_count,
     const uint32_t* outgoing_offsets,
     const uint32_t* outgoing_targets,
+    const int8_t* polarities,
     const uint8_t* spikes,
-    const float* activity_traces,
+    float* activity_traces,
     float* connection_strengths,
+    float* connection_eligibilities,
     int32_t* error_flag,
+    bool plasticity_enabled,
     DeviceBrainConfig config)
 {
     const uint32_t source = blockIdx.x * blockDim.x + threadIdx.x;
@@ -294,31 +319,78 @@ __global__ void update_connections_kernel(
         return;
     }
 
-    const float source_spike = static_cast<float>(spikes[source]);
-    const float source_trace = activity_traces[source];
+    const float old_source_activity = activity_traces[source];
+    const float excitatory = polarities[source] > 0 ? 1.0f : 0.0f;
+
+    if (plasticity_enabled)
+    {
+        for (uint32_t edge = outgoing_offsets[source];
+            edge < outgoing_offsets[source + 1U]; ++edge)
+        {
+            const uint32_t target = outgoing_targets[edge];
+            const float strength = connection_strengths[edge] * config.weight_decay;
+            const float eligibility = connection_eligibilities[edge] * config.eligibility_decay
+                + excitatory * static_cast<float>(spikes[target]) * old_source_activity;
+
+            if (!isfinite(strength) || strength < 0.0f
+                || !isfinite(eligibility) || eligibility < 0.0f)
+            {
+                atomicCAS(error_flag, 0, 2);
+            }
+
+            connection_strengths[edge] = strength;
+            connection_eligibilities[edge] = fminf(config.maximum_eligibility, eligibility);
+        }
+    }
+
+    const float trace = old_source_activity * config.trace_decay
+        + static_cast<float>(spikes[source]);
+    activity_traces[source] = trace;
+
+    if (!isfinite(trace))
+    {
+        atomicCAS(error_flag, 0, 3);
+    }
+}
+
+// applies signed modulation and outgoing budget competition for one source
+__global__ void modulate_connections_kernel(
+    uint32_t neuron_count,
+    const uint32_t* outgoing_offsets,
+    float* connection_strengths,
+    float* connection_eligibilities,
+    int32_t* error_flag,
+    float modulator,
+    DeviceBrainConfig config)
+{
+    const uint32_t source = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (source >= neuron_count)
+    {
+        return;
+    }
+
     float strength_sum = 0.0f;
 
     for (uint32_t edge = outgoing_offsets[source]; edge < outgoing_offsets[source + 1U]; ++edge)
     {
-        const uint32_t target = outgoing_targets[edge];
-        const float target_spike = static_cast<float>(spikes[target]);
-        const float coactivity = source_spike * activity_traces[target]
-            + target_spike * source_trace
-            - source_spike * target_spike;
-        const float strength = connection_strengths[edge] * config.weight_decay
-            + config.learning_rate * coactivity;
-        connection_strengths[edge] = strength;
-        strength_sum += strength;
+        const float delta = config.learning_rate * modulator * connection_eligibilities[edge];
+        const float raw_strength = connection_strengths[edge] + delta;
 
-        if (!isfinite(strength) || strength < 0.0f)
+        if (!isfinite(delta) || !isfinite(raw_strength))
         {
-            atomicCAS(error_flag, 0, 3);
+            atomicCAS(error_flag, 0, 4);
         }
+
+        const float strength = fmaxf(0.0f, raw_strength);
+        connection_strengths[edge] = strength;
+        connection_eligibilities[edge] = 0.0f;
+        strength_sum += strength;
     }
 
     if (!isfinite(strength_sum))
     {
-        atomicCAS(error_flag, 0, 4);
+        atomicCAS(error_flag, 0, 5);
         return;
     }
 
@@ -343,8 +415,10 @@ DeviceBrainConfig make_device_config(const BrainModel& model)
         model.config.dynamics.reset_potential,
         model.config.dynamics.firing_threshold,
         model.trace_decay,
+        model.eligibility_decay,
         model.weight_decay,
         model.config.plasticity.learning_rate,
+        model.config.plasticity.maximum_eligibility,
         model.config.plasticity.outgoing_strength_budget,
         model.refractory_ticks
     };
@@ -390,6 +464,7 @@ public:
         membrane_potentials_.allocate(model_.positions.size());
         activity_traces_.allocate(model_.positions.size());
         connection_strengths_.allocate(model_.outgoing_targets.size());
+        connection_eligibilities_.allocate(model_.outgoing_targets.size());
         refractory_ticks_.allocate(model_.positions.size());
         previous_spikes_.allocate(model_.positions.size());
         next_spikes_.allocate(model_.positions.size());
@@ -437,7 +512,10 @@ public:
     }
 
     // advances the device state through both synchronized model phases
-    void step(span<const float> input_drives)
+    void step(
+        span<const float> input_drives,
+        BrainPerturbation perturbation,
+        bool plasticity_enabled)
     {
         if (requires_reset_)
         {
@@ -455,6 +533,12 @@ public:
             {
                 throw invalid_argument("brain input drives must be finite");
             }
+        }
+
+        if (!isfinite(perturbation.noise_drive_amplitude)
+            || perturbation.noise_drive_amplitude < 0.0f)
+        {
+            throw invalid_argument("brain perturbation amplitude must be finite and nonnegative");
         }
 
         if (tick_ == numeric_limits<uint64_t>::max())
@@ -483,21 +567,26 @@ public:
                 previous_spikes_.data(),
                 next_spikes_.data(),
                 membrane_potentials_.data(),
-                activity_traces_.data(),
                 refractory_ticks_.data(),
                 error_flag_.data(),
+                tick_,
+                perturbation.noise_seed,
+                perturbation.noise_drive_amplitude,
                 config_);
             check_cuda(cudaGetLastError(), "launch CUDA neuron update");
-            update_connections_kernel<<<blocks, CUDA_THREADS_PER_BLOCK>>>(
+            update_plasticity_and_traces_kernel<<<blocks, CUDA_THREADS_PER_BLOCK>>>(
                 neuron_count,
                 outgoing_offsets_.data(),
                 outgoing_targets_.data(),
+                polarities_.data(),
                 next_spikes_.data(),
                 activity_traces_.data(),
                 connection_strengths_.data(),
+                connection_eligibilities_.data(),
                 error_flag_.data(),
+                plasticity_enabled,
                 config_);
-            check_cuda(cudaGetLastError(), "launch CUDA plasticity update");
+            check_cuda(cudaGetLastError(), "launch CUDA plasticity and trace update");
             check_cuda(cudaDeviceSynchronize(), "synchronize CUDA brain step");
             int32_t error = 0;
             error_flag_.download(span<int32_t>(&error, 1U));
@@ -517,6 +606,56 @@ public:
         ++tick_;
     }
 
+    // applies one signed global event to eligible local connections
+    void apply_plasticity_modulation(float modulator)
+    {
+        if (requires_reset_)
+        {
+            throw logic_error("CUDA brain simulator must be reset after a failed device step");
+        }
+
+        if (!isfinite(modulator))
+        {
+            throw invalid_argument("brain plasticity modulator must be finite");
+        }
+
+        if (modulator == 0.0f)
+        {
+            return;
+        }
+
+        try
+        {
+            activate_device();
+            error_flag_.clear();
+            const uint32_t neuron_count = static_cast<uint32_t>(model_.positions.size());
+            const uint32_t blocks = (neuron_count + CUDA_THREADS_PER_BLOCK - 1U)
+                / CUDA_THREADS_PER_BLOCK;
+            modulate_connections_kernel<<<blocks, CUDA_THREADS_PER_BLOCK>>>(
+                neuron_count,
+                outgoing_offsets_.data(),
+                connection_strengths_.data(),
+                connection_eligibilities_.data(),
+                error_flag_.data(),
+                modulator,
+                config_);
+            check_cuda(cudaGetLastError(), "launch CUDA plasticity modulation");
+            check_cuda(cudaDeviceSynchronize(), "synchronize CUDA plasticity modulation");
+            int32_t error = 0;
+            error_flag_.download(span<int32_t>(&error, 1U));
+
+            if (error != 0)
+            {
+                throw runtime_error("CUDA brain modulation produced invalid numerical state");
+            }
+        }
+        catch (...)
+        {
+            requires_reset_ = true;
+            throw;
+        }
+    }
+
     // returns the immutable host copy of the compiled model
     const BrainModel& model() const
     {
@@ -531,12 +670,14 @@ public:
         state.membrane_potentials.resize(model_.positions.size());
         state.activity_traces.resize(model_.positions.size());
         state.connection_strengths.resize(model_.outgoing_targets.size());
+        state.connection_eligibilities.resize(model_.outgoing_targets.size());
         state.refractory_ticks.resize(model_.positions.size());
         state.spikes.resize(model_.positions.size());
         state.tick = tick_;
         membrane_potentials_.download(state.membrane_potentials);
         activity_traces_.download(state.activity_traces);
         connection_strengths_.download(state.connection_strengths);
+        connection_eligibilities_.download(state.connection_eligibilities);
         refractory_ticks_.download(state.refractory_ticks);
         previous_spikes_.download(state.spikes);
         validate_brain_state(model_, state);
@@ -594,6 +735,7 @@ private:
             refractory_ticks_.upload(state.refractory_ticks);
             previous_spikes_.upload(state.spikes);
             next_spikes_.clear();
+            connection_eligibilities_.upload(state.connection_eligibilities);
 
             if (include_strengths)
             {
@@ -625,6 +767,7 @@ private:
     DeviceBuffer<float> membrane_potentials_;
     DeviceBuffer<float> activity_traces_;
     DeviceBuffer<float> connection_strengths_;
+    DeviceBuffer<float> connection_eligibilities_;
     DeviceBuffer<uint32_t> refractory_ticks_;
     DeviceBuffer<uint8_t> previous_spikes_;
     DeviceBuffer<uint8_t> next_spikes_;
@@ -693,10 +836,19 @@ void CudaBrainSimulator::reset(const BrainState& state)
     implementation_->reset(state);
 }
 
-// advances every neuron and connection by one synchronized fixed tick
-void CudaBrainSimulator::step(span<const float> input_drives)
+// advances every neuron and optionally records plasticity by one synchronized fixed tick
+void CudaBrainSimulator::step(
+    span<const float> input_drives,
+    BrainPerturbation perturbation,
+    bool plasticity_enabled)
 {
-    implementation_->step(input_drives);
+    implementation_->step(input_drives, perturbation, plasticity_enabled);
+}
+
+// applies one signed global event to eligible local connections
+void CudaBrainSimulator::apply_plasticity_modulation(float modulator)
+{
+    implementation_->apply_plasticity_modulation(modulator);
 }
 
 // returns the immutable host copy of the compiled model

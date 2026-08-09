@@ -40,6 +40,7 @@ struct EnvironmentConfig
 {
     DungeonConfig dungeon;
     float fixed_time_step = 1.0f / 120.0f;
+    float vision_radius = 24.0f;
     float player_size = 1.4f;
     float acceleration = 30.0f;
     float braking = 42.0f;
@@ -65,6 +66,7 @@ struct EnvironmentState
 struct StepResult
 {
     uint32_t pellets_eaten = 0;
+    bool hit_wall = false;
     uint32_t score = 0;
     uint32_t pellets_remaining = 0;
     double elapsed_seconds = 0.0;
