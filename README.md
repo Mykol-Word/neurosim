@@ -45,9 +45,11 @@ Use `-Configuration Debug` for a debug build or `-Headless` to avoid fetching an
 .\tools\build.ps1 -Headless
 ```
 
-The CUDA backend is explicit and uses a separate build directory:
+The CUDA backend is explicit and uses a separate build directory. Build with the
+viewer when headed CUDA playback is needed:
 
 ```powershell
+.\tools\build.ps1 -Cuda
 .\tools\build.ps1 -Headless -Cuda
 ```
 
@@ -64,7 +66,16 @@ On other platforms, configure normally with CMake and set `NEUROSIM_BUILD_VIEWER
 .\build-neurosim\Release\neurosim_headless.exe --seed 42 --episodes 10
 .\build-neurosim\Release\neurosim_train.exe --seed 1 --brain-seed 2 --episodes 500
 .\build-neurosim\Release\neurosim_game.exe --load-brain runs\brain-2.nsbrain
+.\build-neurosim-cuda\Release\neurosim_train.exe --seed 1 --brain-seed 2 --episodes 500 --backend cuda
+.\build-neurosim-cuda\Release\neurosim_game.exe --load-brain runs\brain-2.nsbrain --backend cuda
 ```
+
+The CPU backend remains the default in every build. Select CUDA explicitly with
+`--backend cuda`; use `--cuda-device N` when the selected device is not device
+zero. A request for an unavailable or unbuilt CUDA backend fails instead of
+silently running on the CPU. Checkpoints are portable between the CPU and CUDA
+backends because they store model identity and learned strengths, not
+backend-specific state.
 
 Use WASD or the arrow keys to move, or pass `--brain` to let the seeded brain control the player and retain learned strengths across automatic resets. Press `R` to generate a new episode immediately. The viewer automatically starts a new seed shortly after a terminal state.
 
@@ -81,7 +92,7 @@ Checkpoints include the seeded model topology and interface fingerprint. Checkpo
 ## Architecture
 
 - `neurosim_core` owns the sparse brain model, generic adaptive controller, CPU reference backend, dungeon generation, collision, and game rules.
-- `AdaptiveController` owns seeded random interfaces, fixed neural timing, uniform input drive, task-blind output exploration, learning freeze state, and CPU brain control.
+- `AdaptiveController` owns seeded random interfaces, fixed neural timing, uniform input drive, task-blind output exploration, learning freeze state, and an explicitly selected brain backend.
 - `BrainAgent` adapts dungeon observations, movement actions, and signed outcomes to the generic controller.
 - `neurosim_cuda` is an optional explicit backend over the same compiled brain arrays and tick order.
 - `neurosim_game` is a raylib client of the core environment.
@@ -93,4 +104,8 @@ Checkpoints include the seeded model topology and interface fingerprint. Checkpo
 - `neurosim_checkpoint_tests` covers learned-state persistence and model identity validation.
 - `neurosim_cuda_tests` compares every CUDA tick with the CPU reference when that backend is built.
 
-CUDA remains absent from the cheap game simulation. The first GPU backend uses reusable contiguous buffers and separate neuron and plasticity kernels, but one small brain may still be slower than the CPU because of launch and synchronization overhead. Large networks and future batches of evolving brains are the intended acceleration case.
+CUDA remains absent from the cheap game simulation. The controller batches all
+neural ticks for one 120 Hz task step, uploads sensory input once, and downloads
+only compact spike totals and the four output activities. Device buffers are
+reused across steps. The CPU backend uses the same model semantics and remains
+the readable parity reference.

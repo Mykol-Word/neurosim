@@ -161,7 +161,7 @@ void test_default_brain_capacity()
 {
     const EnvironmentConfig environment_config;
     const BrainAgent agent(environment_config, {}, 17);
-    const BrainModel& model = agent.simulator().model();
+    const BrainModel& model = agent.model();
     check(model.positions.size() == 5'041U, "default brain neuron count is incorrect");
     check(model.input_neurons.size() == 841U, "default brain interface count is incorrect");
     check(model.output_neurons.size() == 4U, "default brain output count is incorrect");
@@ -197,20 +197,20 @@ void test_seeded_controller_interfaces_are_reproducible()
         CONTROL_TIME_STEP,
         alternate_config,
         42);
-    const BrainModel& model = first.simulator().model();
+    const BrainModel& model = first.model();
 
-    check(model.input_neurons == repeated.simulator().model().input_neurons
-        && model.output_neurons == repeated.simulator().model().output_neurons
+    check(model.input_neurons == repeated.model().input_neurons
+        && model.output_neurons == repeated.model().output_neurons
         && model.initial_connection_strengths
-            == repeated.simulator().model().initial_connection_strengths,
+            == repeated.model().initial_connection_strengths,
         "same controller seed did not reproduce brain construction");
-    check(model.input_neurons == alternate_task.simulator().model().input_neurons
-            && model.output_neurons == alternate_task.simulator().model().output_neurons
+    check(model.input_neurons == alternate_task.model().input_neurons
+            && model.output_neurons == alternate_task.model().output_neurons
             && model.initial_connection_strengths
-                == alternate_task.simulator().model().initial_connection_strengths,
+                == alternate_task.model().initial_connection_strengths,
         "task action patterns changed generic brain construction");
-    check(model.input_neurons != different.simulator().model().input_neurons
-            || model.output_neurons != different.simulator().model().output_neurons,
+    check(model.input_neurons != different.model().input_neurons
+            || model.output_neurons != different.model().output_neurons,
         "different controller seed did not change its interfaces");
     check(model.input_neurons.size() == INPUT_COUNT + OUTPUT_COUNT,
         "controller did not create the requested sensory and exploration inputs");
@@ -249,12 +249,12 @@ void test_seeded_controller_interfaces_are_reproducible()
         0.000001f,
         "controller model did not preserve its configured neural time step");
     check_near(
-        slower_control.simulator().model().config.dynamics.fixed_time_step_seconds,
+        slower_control.model().config.dynamics.fixed_time_step_seconds,
         config.brain_time_step_seconds,
         0.000001f,
         "slower control timing changed the controller model time step");
     check_near(
-        slower_control.simulator().model().config.dynamics.fixed_time_step_seconds,
+        slower_control.model().config.dynamics.fixed_time_step_seconds,
         model.config.dynamics.fixed_time_step_seconds,
         0.0f,
         "compatible control rates produced different neural time steps");
@@ -267,8 +267,8 @@ void test_seeded_controller_interfaces_are_reproducible()
     first.step(inputs);
     first.step(inputs);
     slower_control.step(inputs);
-    const BrainState& fast_state = first.simulator().state();
-    const BrainState& slow_state = slower_control.simulator().state();
+    const BrainState fast_state = first.copy_state();
+    const BrainState slow_state = slower_control.copy_state();
     check(fast_state.tick == slow_state.tick
             && fast_state.membrane_potentials == slow_state.membrane_potentials
             && fast_state.activity_traces == slow_state.activity_traces
@@ -324,17 +324,17 @@ void test_controller_freeze_blocks_modulation()
     AdaptiveController controller(4, 3, 0.1f, config, 23);
     const vector<float> inputs(4, 0.0f);
     controller.step(inputs);
-    const vector<float> enabled_strengths = controller.simulator().state().connection_strengths;
+    const vector<float> enabled_strengths = controller.copy_connection_strengths();
     controller.apply_modulation(1.0f);
-    check(controller.simulator().state().connection_strengths != enabled_strengths,
+    check(controller.copy_connection_strengths() != enabled_strengths,
         "enabled controller ignored eligible direct modulation");
 
     controller.step(inputs);
     controller.set_learning_enabled(false);
     check(!controller.learning_enabled(), "controller did not enter frozen mode");
-    const vector<float> frozen_strengths = controller.simulator().state().connection_strengths;
+    const vector<float> frozen_strengths = controller.copy_connection_strengths();
     controller.apply_modulation(1.0f);
-    check(controller.simulator().state().connection_strengths == frozen_strengths,
+    check(controller.copy_connection_strengths() == frozen_strengths,
         "frozen controller applied direct modulation");
 }
 
@@ -353,18 +353,18 @@ void test_food_modulation_respects_learning_mode()
     BrainAgent agent(environment_config, agent_config, 12);
     environment.step(None);
     agent.decide(environment);
-    const vector<float> before = agent.simulator().state().connection_strengths;
+    const vector<float> before = agent.copy_connection_strengths();
     StepResult food;
     food.pellets_eaten = 1U;
     agent.observe_transition(food);
-    check(agent.simulator().state().connection_strengths != before,
+    check(agent.copy_connection_strengths() != before,
         "food did not modulate eligible strengths");
     agent.set_learning_enabled(false);
     agent.reset_episode(2);
     agent.decide(environment);
-    const vector<float> frozen = agent.simulator().state().connection_strengths;
+    const vector<float> frozen = agent.copy_connection_strengths();
     agent.observe_transition(food);
-    check(agent.simulator().state().connection_strengths == frozen,
+    check(agent.copy_connection_strengths() == frozen,
         "frozen validation changed learned strengths");
 }
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "neurosim/cpu_brain.h"
+#include "neurosim/brain_simulator.h"
 
 #include <cstdint>
 #include <span>
@@ -33,8 +33,8 @@ struct AdaptiveControllerStatus
 {
     vector<float> output_activity;
     vector<float> exploration_outputs;
-    uint32_t brain_spikes = 0;
-    uint32_t output_spikes = 0;
+    uint64_t brain_spikes = 0;
+    uint64_t output_spikes = 0;
     bool exploring = false;
 };
 
@@ -48,7 +48,9 @@ public:
         uint32_t output_count,
         float control_time_step_seconds,
         AdaptiveControllerConfig config = {},
-        uint64_t seed = 1);
+        uint64_t seed = 1,
+        BrainExecutionConfig execution = {},
+        BrainSimulatorFactory simulator_factory = nullptr);
 
     // advances one control step from normalized task-owned inputs
     const AdaptiveControllerStatus& step(span<const float> normalized_inputs);
@@ -67,6 +69,12 @@ public:
 
     // replaces learned strengths after validating them against this controller
     void load_connection_strengths(span<const float> strengths);
+
+    // returns a host copy of the learned connection strengths
+    vector<float> copy_connection_strengths() const;
+
+    // returns a full host snapshot for diagnostics outside the hot path
+    BrainState copy_state() const;
 
     // returns the fixed construction seed
     uint64_t seed() const;
@@ -89,11 +97,15 @@ public:
     // returns whether connection-strength adaptation is enabled
     bool learning_enabled() const;
 
-    // returns the cpu reference simulator for recording and checkpoints
-    const CpuBrainSimulator& simulator() const;
+    // returns the immutable compiled brain model
+    const BrainModel& model() const;
+
+    // returns the explicit execution backend
+    BrainBackend backend() const;
 
 private:
     AdaptiveControllerConfig config_;
+    BrainExecutionConfig execution_;
     uint64_t seed_ = 0;
     uint64_t exploration_seed_ = 0;
     uint64_t control_tick_ = 0;
@@ -110,7 +122,7 @@ private:
     bool exploration_enabled_ = true;
     bool learning_enabled_ = true;
     vector<float> brain_inputs_;
-    CpuBrainSimulator simulator_;
+    unique_ptr<BrainSimulator> simulator_;
     AdaptiveControllerStatus status_;
 };
 

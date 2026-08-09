@@ -12,7 +12,9 @@ Each normalized sensory value is validated in `[0, 1]` and multiplied by the sam
 
 One normally silent external drive channel targets each output neuron. These channels let exploration express a supplied anonymous output pattern; they are not part of the task observation. When no task codebook is supplied, the controller uses one-hot patterns.
 
-The brain uses its own fixed timestep, defaulting to `1/480` second. The controller accumulates neural time independently from the task control rate; the default 120 Hz dungeon therefore advances four neural ticks per control tick. Changing a task's control rate does not change neuron, decay, refractory, or plasticity timing. The controller returns only output activity, spike counts, and the current exploration pattern. The task adapter decides what those outputs mean.
+The brain uses its own fixed timestep, defaulting to `1/480` second. The controller accumulates neural time independently from the task control rate; the default 120 Hz dungeon therefore advances four neural ticks per control tick. Changing a task's control rate does not change neuron, decay, refractory, or plasticity timing. Those ticks are submitted as one backend batch per control step so CUDA can reuse one sensory upload and one packed result download without changing tick order. The controller returns only output activity, spike counts, and the current exploration pattern. The task adapter decides what those outputs mean.
+
+Backend selection is explicit and task-neutral. The CPU simulator is the default readable reference. A CUDA build can select the CUDA simulator without changing controller, observation, action, or checkpoint semantics; an unavailable CUDA request fails rather than falling back. Full state and learned-strength transfers are diagnostic and episode-boundary operations, not part of the neural tick hot path.
 
 ## Dungeon observation
 

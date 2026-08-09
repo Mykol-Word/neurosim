@@ -1,6 +1,10 @@
 #include "neurosim/brain_agent.h"
 #include "neurosim/brain_checkpoint.h"
 
+#if defined(NEUROSIM_HAS_CUDA)
+#include "neurosim/cuda_brain.h"
+#endif
+
 #include <raylib.h>
 
 #include <algorithm>
@@ -12,6 +16,7 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -52,11 +57,14 @@ struct Options
 {
     uint64_t seed = 1;
     uint64_t brain_seed = 1;
+    BrainBackend backend = BrainBackend::Cpu;
+    int32_t cuda_device = 0;
     string capture_path;
     filesystem::path load_brain_path;
     uint64_t exit_after_frames = 0;
     bool brain_control = false;
     bool brain_seed_explicit = false;
+    bool cuda_device_explicit = false;
     bool learning_enabled = true;
     bool learning_explicit = false;
 };
@@ -125,6 +133,41 @@ uint64_t parse_unsigned(string_view text, const char* message)
     return value;
 }
 
+// parses one explicit brain execution backend
+BrainBackend parse_backend(string_view text)
+{
+    using enum BrainBackend;
+
+    if (text == "cpu")
+    {
+        return Cpu;
+    }
+
+    if (text == "cuda")
+    {
+        return Cuda;
+    }
+
+    throw invalid_argument("invalid --backend value; expected cpu or cuda");
+}
+
+// returns the factory compiled for one explicitly selected backend
+BrainSimulatorFactory backend_factory(BrainBackend backend)
+{
+    using enum BrainBackend;
+
+    if (backend == Cpu)
+    {
+        return nullptr;
+    }
+
+#if defined(NEUROSIM_HAS_CUDA)
+    return make_cuda_brain_simulator;
+#else
+    throw runtime_error("cuda backend is unavailable; rebuild with NEUROSIM_BUILD_CUDA=ON");
+#endif
+}
+
 // parses viewer command-line options
 Options parse_options(int argc, char** argv)
 {
@@ -146,6 +189,24 @@ Options parse_options(int argc, char** argv)
         {
             options.brain_seed = parse_unsigned(argv[++index], "invalid --brain-seed value");
             options.brain_seed_explicit = true;
+        }
+        else if (argument == "--backend" && index + 1 < argc)
+        {
+            options.backend = parse_backend(argv[++index]);
+            options.brain_control = true;
+        }
+        else if (argument == "--cuda-device" && index + 1 < argc)
+        {
+            const uint64_t device = parse_unsigned(argv[++index], "invalid --cuda-device value");
+
+            if (device > static_cast<uint64_t>(numeric_limits<int32_t>::max()))
+            {
+                throw invalid_argument("cuda device index is too large");
+            }
+
+            options.cuda_device = static_cast<int32_t>(device);
+            options.cuda_device_explicit = true;
+            options.brain_control = true;
         }
         else if (argument == "--load-brain" && index + 1 < argc)
         {
@@ -182,6 +243,7 @@ Options parse_options(int argc, char** argv)
         {
             throw invalid_argument(
                 "usage: neurosim_game [--seed N] [--brain] [--brain-seed N] "
+                "[--backend cpu|cuda] [--cuda-device N] "
                 "[--load-brain PATH] [--learn] [--capture PATH] "
                 "[--exit-after-frames N]");
         }
@@ -190,6 +252,11 @@ Options parse_options(int argc, char** argv)
     if (!options.load_brain_path.empty() && !options.learning_explicit)
     {
         options.learning_enabled = false;
+    }
+
+    if (options.cuda_device_explicit && options.backend != BrainBackend::Cuda)
+    {
+        throw invalid_argument("--cuda-device requires --backend cuda");
     }
 
     return options;
@@ -569,11 +636,17 @@ int run(const Options& options)
 
     if (options.brain_control)
     {
-        brain_agent.emplace(environment.config(), BrainAgentConfig{}, brain_seed);
+        const BrainExecutionConfig execution{options.backend, options.cuda_device};
+        brain_agent.emplace(
+            environment.config(),
+            BrainAgentConfig{},
+            brain_seed,
+            execution,
+            backend_factory(options.backend));
 
         if (checkpoint)
         {
-            validate_brain_checkpoint(*checkpoint, brain_agent->seed(), brain_agent->simulator().model());
+            validate_brain_checkpoint(*checkpoint, brain_agent->seed(), brain_agent->model());
             brain_agent->load_connection_strengths(checkpoint->connection_strengths);
         }
 

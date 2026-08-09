@@ -1,4 +1,5 @@
 #include "neurosim/adaptive_controller.h"
+#include "neurosim/cpu_brain.h"
 
 #include <algorithm>
 #include <array>
@@ -215,6 +216,42 @@ BrainModel make_controller_model(
         seed ^ 0x9e3779b97f4a7c15ULL);
 }
 
+// creates the requested backend after compiling one shared brain model
+unique_ptr<BrainSimulator> make_controller_simulator(
+    const AdaptiveControllerConfig& config,
+    uint32_t input_count,
+    uint32_t output_count,
+    uint64_t seed,
+    const BrainExecutionConfig& execution,
+    BrainSimulatorFactory simulator_factory)
+{
+    if (execution.cuda_device < 0)
+    {
+        throw invalid_argument("brain execution device must be nonnegative");
+    }
+
+    if (simulator_factory == nullptr)
+    {
+        if (execution.backend != BrainBackend::Cpu)
+        {
+            throw invalid_argument("requested brain backend has no simulator factory");
+        }
+
+        simulator_factory = make_cpu_brain_simulator;
+    }
+
+    unique_ptr<BrainSimulator> simulator = simulator_factory(
+        make_controller_model(config, input_count, output_count, seed),
+        execution);
+
+    if (simulator == nullptr || simulator->backend() != execution.backend)
+    {
+        throw logic_error("brain simulator factory returned the wrong backend");
+    }
+
+    return simulator;
+}
+
 }
 
 // constructs reproducible random interfaces using only channel counts and a seed
@@ -223,17 +260,26 @@ AdaptiveController::AdaptiveController(
     uint32_t output_count,
     float control_time_step_seconds,
     AdaptiveControllerConfig config,
-    uint64_t seed)
+    uint64_t seed,
+    BrainExecutionConfig execution,
+    BrainSimulatorFactory simulator_factory)
     : config_(prepare_config(
           move(config),
           input_count,
           output_count,
           control_time_step_seconds)),
+      execution_(execution),
       seed_(seed),
       input_count_(input_count),
       output_count_(output_count),
       control_time_step_seconds_(control_time_step_seconds),
-      simulator_(make_controller_model(config_, input_count_, output_count_, seed_))
+      simulator_(make_controller_simulator(
+          config_,
+          input_count_,
+          output_count_,
+          seed_,
+          execution_,
+          simulator_factory))
 {
     exploration_interval_ticks_ = duration_ticks(
         config_.exploration_interval_seconds,
@@ -241,7 +287,7 @@ AdaptiveController::AdaptiveController(
     exploration_duration_ticks_ = duration_ticks(
         config_.exploration_duration_seconds,
         control_time_step_seconds);
-    brain_inputs_.resize(simulator_.model().input_neurons.size());
+    brain_inputs_.resize(simulator_->model().input_neurons.size());
     status_.output_activity.resize(output_count_);
     status_.exploration_outputs.resize(output_count_);
     reset_episode(0U);
@@ -314,26 +360,24 @@ const AdaptiveControllerStatus& AdaptiveController::step(span<const float> norma
             throw logic_error("controller exceeded its validated neural step bound");
         }
 
-        simulator_.step(brain_inputs_, {}, learning_enabled_);
         pending_brain_time_seconds_ -= brain_time_step;
         pending_brain_time_seconds_ = max(0.0, pending_brain_time_seconds_);
         ++brain_steps;
-
-        for (const uint8_t spike : simulator_.state().spikes)
-        {
-            status_.brain_spikes += spike;
-        }
-
-        for (uint32_t output = 0; output < output_count_; ++output)
-        {
-            status_.output_spikes += static_cast<uint32_t>(simulator_.output_spike(output));
-        }
     }
 
-    for (uint32_t output = 0; output < output_count_; ++output)
+    if (brain_steps == 0U)
     {
-        status_.output_activity[output] = simulator_.output_activity(output);
+        throw logic_error("controller produced no neural steps for one control step");
     }
+
+    const BrainAdvanceSummary summary = simulator_->advance(
+        brain_inputs_,
+        brain_steps,
+        {},
+        learning_enabled_,
+        status_.output_activity);
+    status_.brain_spikes = summary.neuron_spikes;
+    status_.output_spikes = summary.output_spikes;
 
     if (status_.exploring)
     {
@@ -349,14 +393,14 @@ void AdaptiveController::apply_modulation(float value)
 {
     if (learning_enabled_)
     {
-        simulator_.apply_plasticity_modulation(value);
+        simulator_->apply_plasticity_modulation(value);
     }
 }
 
 // clears activity and restarts seeded exploration while preserving learned strengths
 void AdaptiveController::reset_episode(uint64_t episode_seed)
 {
-    simulator_.reset_activity();
+    simulator_->reset_activity();
     exploration_seed_ = mix_seed(seed_ ^ episode_seed ^ 0x632be59bd9b4e019ULL);
     control_tick_ = 0U;
     next_exploration_tick_ = 0U;
@@ -394,9 +438,19 @@ void AdaptiveController::set_learning_enabled(bool enabled)
 // replaces learned strengths after validating them against this controller
 void AdaptiveController::load_connection_strengths(span<const float> strengths)
 {
-    BrainState state = make_brain_state(simulator_.model());
-    state.connection_strengths.assign(strengths.begin(), strengths.end());
-    simulator_.reset(move(state));
+    simulator_->load_connection_strengths(strengths);
+}
+
+// returns a host copy of the learned connection strengths
+vector<float> AdaptiveController::copy_connection_strengths() const
+{
+    return simulator_->copy_connection_strengths();
+}
+
+// returns a full host snapshot for diagnostics outside the hot path
+BrainState AdaptiveController::copy_state() const
+{
+    return simulator_->copy_state();
 }
 
 // returns the fixed construction seed
@@ -441,10 +495,16 @@ bool AdaptiveController::learning_enabled() const
     return learning_enabled_;
 }
 
-// returns the cpu reference simulator for recording and checkpoints
-const CpuBrainSimulator& AdaptiveController::simulator() const
+// returns the immutable compiled brain model
+const BrainModel& AdaptiveController::model() const
 {
-    return simulator_;
+    return simulator_->model();
+}
+
+// returns the explicit execution backend
+BrainBackend AdaptiveController::backend() const
+{
+    return simulator_->backend();
 }
 
 }

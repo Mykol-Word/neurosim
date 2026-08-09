@@ -13,6 +13,7 @@ add_library(neurosim_core
     src/brain.cpp
     src/brain_agent.cpp
     src/brain_checkpoint.cpp
+    src/brain_simulator.cpp
     src/cpu_brain.cpp
     src/dungeon.cpp
     src/environment.cpp
@@ -104,6 +105,12 @@ if(NEUROSIM_BUILD_CUDA)
             $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wextra>
             $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wpedantic>
         )
+    endif()
+
+    target_link_libraries(neurosim_train PRIVATE neurosim_cuda)
+
+    if(TARGET neurosim_game)
+        target_link_libraries(neurosim_game PRIVATE neurosim_cuda)
     endif()
 endif()
 

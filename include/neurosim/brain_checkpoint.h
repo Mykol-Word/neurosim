@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <span>
 #include <vector>
 
 namespace neurosim
@@ -27,7 +28,7 @@ void save_brain_checkpoint(
     const filesystem::path& path,
     uint64_t brain_seed,
     const BrainModel& model,
-    const BrainState& state);
+    span<const float> connection_strengths);
 
 // reads one versioned binary brain checkpoint
 BrainCheckpoint load_brain_checkpoint(const filesystem::path& path);

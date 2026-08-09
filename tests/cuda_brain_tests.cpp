@@ -131,6 +131,215 @@ BrainModel make_modulation_model()
     return build_brain_model(layout, config, 17);
 }
 
+// verifies one cpu batch exactly matches repeated reference steps
+void test_cpu_batched_advance()
+{
+    const BrainModel model = make_parity_model();
+    CpuBrainSimulator repeated(model);
+    CpuBrainSimulator batched(model);
+    const array<float, 2> input{520.0f, 180.0f};
+    const BrainPerturbation perturbation{210.0f, 1872};
+    constexpr uint32_t TICK_COUNT = 23U;
+    BrainAdvanceSummary repeated_summary;
+
+    for (uint32_t tick = 0; tick < TICK_COUNT; ++tick)
+    {
+        repeated.step(input, perturbation);
+
+        for (const uint8_t spike : repeated.state().spikes)
+        {
+            repeated_summary.neuron_spikes += spike;
+        }
+
+        for (const uint32_t output_neuron : model.output_neurons)
+        {
+            repeated_summary.output_spikes += repeated.state().spikes[output_neuron];
+        }
+    }
+
+    array<float, 2> output_activity{};
+    const BrainAdvanceSummary batched_summary = batched.advance(
+        input,
+        TICK_COUNT,
+        perturbation,
+        true,
+        output_activity);
+    check(batched_summary.neuron_spikes == repeated_summary.neuron_spikes,
+        "repeated and batched CPU neuron spike totals differ");
+    check(batched_summary.output_spikes == repeated_summary.output_spikes,
+        "repeated and batched CPU output spike totals differ");
+    check_state_parity(repeated.state(), batched.state());
+
+    for (uint32_t output = 0; output < output_activity.size(); ++output)
+    {
+        check_near(output_activity[output], repeated.output_activity(output),
+            "batched CPU output activity differs from repeated steps");
+    }
+}
+
+// verifies one cuda batch matches cpu summaries, outputs, and complete state
+void test_cpu_cuda_batched_advance()
+{
+    const BrainModel model = make_parity_model();
+    CpuBrainSimulator cpu(model);
+    CudaBrainSimulator cuda(model);
+    const array<float, 2> input{610.0f, 240.0f};
+    const BrainPerturbation perturbation{160.0f, 8119};
+    constexpr uint32_t TICK_COUNT = 31U;
+    array<float, 2> cpu_activity{};
+    array<float, 2> cuda_activity{};
+    const BrainAdvanceSummary cpu_summary = cpu.advance(
+        input,
+        TICK_COUNT,
+        perturbation,
+        true,
+        cpu_activity);
+    const BrainAdvanceSummary cuda_summary = cuda.advance(
+        input,
+        TICK_COUNT,
+        perturbation,
+        true,
+        cuda_activity);
+    check(cuda_summary.neuron_spikes == cpu_summary.neuron_spikes,
+        "CPU and CUDA batched neuron spike totals differ");
+    check(cuda_summary.output_spikes == cpu_summary.output_spikes,
+        "CPU and CUDA batched output spike totals differ");
+    check_state_parity(cpu.state(), cuda.download_state());
+
+    for (uint32_t output = 0; output < cuda_activity.size(); ++output)
+    {
+        check_near(cuda_activity[output], cpu_activity[output],
+            "CPU and CUDA batched output activities differ");
+    }
+}
+
+// verifies cuda batch validation leaves valid state usable
+void test_cuda_advance_validation()
+{
+    const BrainModel model = make_parity_model();
+    CpuBrainSimulator cpu(model);
+    CudaBrainSimulator cuda(model);
+    const array<float, 2> input{0.0f, 0.0f};
+    array<float, 1> wrong_output{};
+    bool rejected_zero_ticks = false;
+
+    try
+    {
+        cuda.advance(input, 0U, {}, true, {});
+    }
+    catch (const invalid_argument&)
+    {
+        rejected_zero_ticks = true;
+    }
+
+    check(rejected_zero_ticks, "CUDA advance accepted zero ticks");
+    bool cpu_rejected_zero_ticks = false;
+
+    try
+    {
+        cpu.advance(input, 0U, {}, true, {});
+    }
+    catch (const invalid_argument&)
+    {
+        cpu_rejected_zero_ticks = true;
+    }
+
+    check(cpu_rejected_zero_ticks, "CPU advance accepted zero ticks");
+    bool rejected_output_size = false;
+
+    try
+    {
+        cuda.advance(input, 1U, {}, true, wrong_output);
+    }
+    catch (const invalid_argument&)
+    {
+        rejected_output_size = true;
+    }
+
+    check(rejected_output_size, "CUDA advance accepted the wrong output activity size");
+    bool cpu_rejected_output_size = false;
+
+    try
+    {
+        cpu.advance(input, 1U, {}, true, wrong_output);
+    }
+    catch (const invalid_argument&)
+    {
+        cpu_rejected_output_size = true;
+    }
+
+    check(cpu_rejected_output_size, "CPU advance accepted the wrong output activity size");
+    const BrainAdvanceSummary summary = cuda.advance(input, 1U, {}, true, {});
+    check(summary.neuron_spikes <= model.positions.size(),
+        "CUDA advance returned an impossible neuron spike count");
+    check(cuda.download_state().tick == 1U,
+        "CUDA validation failure changed the simulator tick");
+}
+
+// verifies private-stream kernels never race model or state uploads
+void test_cuda_state_upload_ordering()
+{
+    const BrainModel model = make_parity_model();
+    BrainState initial = make_brain_state(model);
+
+    for (float& strength : initial.connection_strengths)
+    {
+        strength *= 0.625f;
+    }
+
+    const array<float, 2> input{640.0f, 215.0f};
+
+    for (uint32_t iteration = 0; iteration < 32U; ++iteration)
+    {
+        CpuBrainSimulator cpu(model);
+        CudaBrainSimulator cuda(model);
+        cpu.reset(initial);
+        cuda.reset(initial);
+        cpu.advance(input, 3U, {}, true, {});
+        cuda.advance(input, 3U, {}, true, {});
+        check_state_parity(cpu.state(), cuda.download_state());
+    }
+}
+
+// verifies backend construction and learned strength transfers stay explicit
+void test_cuda_backend_interface()
+{
+    using enum BrainBackend;
+
+    const BrainModel model = make_modulation_model();
+    const BrainExecutionConfig execution{Cuda, 0};
+    unique_ptr<BrainSimulator> simulator = make_cuda_brain_simulator(model, execution);
+    check(simulator->backend() == Cuda, "CUDA factory returned the wrong backend");
+    vector<float> strengths = model.initial_connection_strengths;
+
+    for (float& strength : strengths)
+    {
+        strength *= 0.5f;
+    }
+
+    simulator->load_connection_strengths(strengths);
+    check(simulator->copy_connection_strengths() == strengths,
+        "CUDA learned strength transfer changed values");
+    const CudaDeviceInfo device = cuda_device_info();
+    check(!device.name.empty(), "CUDA device metadata omitted the device name");
+    check(device.compute_major > 0, "CUDA device metadata has invalid compute capability");
+    check(device.driver_version > 0 && device.runtime_version > 0
+        && device.toolkit_version > 0,
+        "CUDA device metadata omitted software versions");
+    bool rejected_cpu_request = false;
+
+    try
+    {
+        make_cuda_brain_simulator(model, {Cpu, 0});
+    }
+    catch (const invalid_argument&)
+    {
+        rejected_cpu_request = true;
+    }
+
+    check(rejected_cpu_request, "CUDA factory accepted a CPU execution request");
+}
+
 // verifies dynamics, plasticity, outputs, and both reset modes across backends
 void test_cpu_cuda_trajectory_parity()
 {
@@ -287,7 +496,7 @@ void test_cuda_isolated_neuron()
 // verifies kernel bounds immediately around block and multi-block sizes
 void test_cuda_kernel_boundaries()
 {
-    constexpr array<uint32_t, 4> NEURON_COUNTS{31U, 32U, 33U, 257U};
+    constexpr array<uint32_t, 4> NEURON_COUNTS{127U, 128U, 129U, 257U};
 
     for (const uint32_t neuron_count : NEURON_COUNTS)
     {
@@ -326,11 +535,16 @@ int main()
             return 77;
         }
 
+        test_cpu_batched_advance();
+        test_cpu_cuda_batched_advance();
+        test_cuda_advance_validation();
+        test_cuda_state_upload_ordering();
+        test_cuda_backend_interface();
         test_cpu_cuda_trajectory_parity();
         test_cuda_modulated_plasticity();
         test_cuda_isolated_neuron();
         test_cuda_kernel_boundaries();
-        cout << "4 CUDA brain tests passed\n";
+        cout << "9 CUDA brain tests passed\n";
         return 0;
     }
     catch (const exception& error)

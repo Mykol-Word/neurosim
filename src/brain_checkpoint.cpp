@@ -164,10 +164,9 @@ void save_brain_checkpoint(
     const filesystem::path& path,
     uint64_t brain_seed,
     const BrainModel& model,
-    const BrainState& state)
+    span<const float> connection_strengths)
 {
-    validate_brain_model(model);
-    validate_brain_state(model, state);
+    validate_connection_strengths(model, connection_strengths);
 
     if (path.empty())
     {
@@ -197,9 +196,9 @@ void save_brain_checkpoint(
         write_value(stream, CHECKPOINT_VERSION);
         write_value(stream, brain_seed);
         write_value(stream, brain_model_fingerprint(model));
-        write_value(stream, static_cast<uint64_t>(state.connection_strengths.size()));
+        write_value(stream, static_cast<uint64_t>(connection_strengths.size()));
 
-        for (const float strength : state.connection_strengths)
+        for (const float strength : connection_strengths)
         {
             write_value(stream, strength);
         }

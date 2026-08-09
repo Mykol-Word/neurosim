@@ -1,6 +1,10 @@
 #include "neurosim/brain_agent.h"
 #include "neurosim/brain_checkpoint.h"
 
+#if defined(NEUROSIM_HAS_CUDA)
+#include "neurosim/cuda_brain.h"
+#endif
+
 #include <algorithm>
 #include <bit>
 #include <charconv>
@@ -35,9 +39,12 @@ struct Options
     uint64_t validation_interval = 25;
     uint64_t validation_episodes = 8;
     uint64_t validation_seed = DEFAULT_VALIDATION_SEED;
+    BrainBackend backend = BrainBackend::Cpu;
+    int32_t cuda_device = 0;
     filesystem::path load_path;
     filesystem::path save_path;
     bool brain_seed_explicit = false;
+    bool cuda_device_explicit = false;
 };
 
 // accumulates behavior and neural activity for one episode
@@ -102,15 +109,34 @@ void print_run_metadata(
     const DungeonConfig& dungeon = environment.dungeon;
     const BrainAgentConfig& dungeon_agent = agent.config();
     const AdaptiveControllerConfig& controller = agent.controller().config();
-    const BrainConfig& brain = agent.simulator().model().config;
+    const BrainConfig& brain = agent.model().config;
     const NeuronDynamicsConfig& dynamics = brain.dynamics;
     const PlasticityConfig& plasticity = brain.plasticity;
     cout
         << "{\"phase\":\"run_metadata\""
         << ",\"schema_version\":1"
         << ",\"software_version\":\"" << SOFTWARE_VERSION << "\""
-        << ",\"backend\":\"cpu\""
-        << ",\"precision\":\"float32\""
+        << ",\"backend\":\"" << brain_backend_name(agent.backend()) << "\""
+        << ",\"precision\":\"float32\"";
+
+#if defined(NEUROSIM_HAS_CUDA)
+    if (agent.backend() == BrainBackend::Cuda)
+    {
+        const CudaDeviceInfo device = cuda_device_info(options.cuda_device);
+        cout
+            << ",\"cuda\":{"
+            << "\"device\":" << options.cuda_device
+            << ",\"name\":\"" << device.name << "\""
+            << ",\"compute_capability\":\"" << device.compute_major
+            << '.' << device.compute_minor << "\""
+            << ",\"driver_version\":" << device.driver_version
+            << ",\"runtime_version\":" << device.runtime_version
+            << ",\"toolkit_version\":" << device.toolkit_version
+            << '}';
+    }
+#endif
+
+    cout
         << ",\"first_environment_seed\":" << options.first_environment_seed
         << ",\"brain_seed\":" << agent.seed()
         << ",\"episodes\":" << options.episodes
@@ -185,7 +211,7 @@ void print_run_metadata(
         << controller.exploration_patterns.size()
         << "}"
         << ",\"brain\":{"
-        << "\"model_fingerprint\":" << brain_model_fingerprint(agent.simulator().model())
+        << "\"model_fingerprint\":" << brain_model_fingerprint(agent.model())
         << ",\"connection_radius_steps\":" << brain.connection_radius_steps
         << ",\"fixed_time_step_seconds\":" << dynamics.fixed_time_step_seconds
         << ",\"membrane_time_constant_seconds\":"
@@ -219,6 +245,41 @@ uint64_t parse_unsigned(string_view text, const char* name)
     }
 
     return value;
+}
+
+// parses one explicit brain execution backend
+BrainBackend parse_backend(string_view text)
+{
+    using enum BrainBackend;
+
+    if (text == "cpu")
+    {
+        return Cpu;
+    }
+
+    if (text == "cuda")
+    {
+        return Cuda;
+    }
+
+    throw invalid_argument("invalid --backend value; expected cpu or cuda");
+}
+
+// returns the factory compiled for one explicitly selected backend
+BrainSimulatorFactory backend_factory(BrainBackend backend)
+{
+    using enum BrainBackend;
+
+    if (backend == Cpu)
+    {
+        return nullptr;
+    }
+
+#if defined(NEUROSIM_HAS_CUDA)
+    return make_cuda_brain_simulator;
+#else
+    throw runtime_error("cuda backend is unavailable; rebuild with NEUROSIM_BUILD_CUDA=ON");
+#endif
 }
 
 // parses all supported learning-run options
@@ -259,6 +320,22 @@ Options parse_options(int argc, char** argv)
             options.validation_seed = parse_unsigned(
                 argv[++index], "invalid --validation-seed value");
         }
+        else if (argument == "--backend" && index + 1 < argc)
+        {
+            options.backend = parse_backend(argv[++index]);
+        }
+        else if (argument == "--cuda-device" && index + 1 < argc)
+        {
+            const uint64_t device = parse_unsigned(argv[++index], "invalid --cuda-device value");
+
+            if (device > static_cast<uint64_t>(numeric_limits<int32_t>::max()))
+            {
+                throw invalid_argument("cuda device index is too large");
+            }
+
+            options.cuda_device = static_cast<int32_t>(device);
+            options.cuda_device_explicit = true;
+        }
         else if (argument == "--load-brain" && index + 1 < argc)
         {
             options.load_path = argv[++index];
@@ -272,6 +349,7 @@ Options parse_options(int argc, char** argv)
             throw invalid_argument(
                 "usage: neurosim_train [--seed N] [--brain-seed N] [--episodes N] "
                 "[--validation-interval N] [--validation-episodes N] [--validation-seed N] "
+                "[--backend cpu|cuda] [--cuda-device N] "
                 "[--load-brain PATH] [--save-brain PATH]");
         }
     }
@@ -289,6 +367,11 @@ Options parse_options(int argc, char** argv)
     if (options.validation_interval > 0U && options.validation_episodes == 0U)
     {
         throw invalid_argument("validation episode count must be positive when validation is enabled");
+    }
+
+    if (options.cuda_device_explicit && options.backend != BrainBackend::Cuda)
+    {
+        throw invalid_argument("--cuda-device requires --backend cuda");
     }
 
     return options;
@@ -385,8 +468,8 @@ EpisodeMetrics run_episode(Environment& environment, BrainAgent& agent)
 // summarizes current learned strengths and outgoing competition
 WeightMetrics measure_weights(const BrainAgent& agent)
 {
-    const BrainModel& model = agent.simulator().model();
-    const vector<float>& strengths = agent.simulator().state().connection_strengths;
+    const BrainModel& model = agent.model();
+    const vector<float> strengths = agent.copy_connection_strengths();
     WeightMetrics metrics;
     uint64_t zero_count = 0;
     uint64_t entropy_sources = 0;
@@ -457,9 +540,9 @@ void print_episode(
     const WeightMetrics weights = measure_weights(agent);
     const double elapsed = environment.elapsed_seconds();
     const double neuron_seconds = elapsed
-        * static_cast<double>(agent.simulator().model().positions.size());
+        * static_cast<double>(agent.model().positions.size());
     const double output_seconds = elapsed
-        * static_cast<double>(agent.simulator().model().output_neurons.size());
+        * static_cast<double>(agent.model().output_neurons.size());
     const double alignment = episode_metrics.visible_food_moving_steps == 0U
         ? 0.0
         : static_cast<double>(episode_metrics.toward_food_steps)
@@ -573,22 +656,30 @@ int main(int argc, char** argv)
         }
 
         Environment environment({}, options.first_environment_seed);
-        BrainAgent agent(environment.config(), {}, options.brain_seed);
+        const BrainExecutionConfig execution{options.backend, options.cuda_device};
+        BrainAgent agent(
+            environment.config(),
+            {},
+            options.brain_seed,
+            execution,
+            backend_factory(options.backend));
 
         if (checkpoint)
         {
-            validate_brain_checkpoint(*checkpoint, agent.seed(), agent.simulator().model());
+            validate_brain_checkpoint(*checkpoint, agent.seed(), agent.model());
             agent.load_connection_strengths(checkpoint->connection_strengths);
         }
+
+        const vector<float> starting_strengths = agent.copy_connection_strengths();
 
         print_run_metadata(
             options,
             environment.config(),
             agent,
-            strength_fingerprint(agent.simulator().state().connection_strengths),
+            strength_fingerprint(starting_strengths),
             checkpoint.has_value());
 
-        vector<float> best_strengths = agent.simulator().state().connection_strengths;
+        vector<float> best_strengths = starting_strengths;
         ValidationScore best_validation;
         int64_t best_episode = -1;
         bool has_validation = false;
@@ -625,7 +716,7 @@ int main(int argc, char** argv)
                 if (!has_validation || is_better_validation(validation, best_validation))
                 {
                     best_validation = validation;
-                    best_strengths = agent.simulator().state().connection_strengths;
+                    best_strengths = agent.copy_connection_strengths();
                     best_episode = static_cast<int64_t>(episode);
                     has_validation = true;
                 }
@@ -645,7 +736,7 @@ int main(int argc, char** argv)
             if (!has_validation || is_better_validation(validation, best_validation))
             {
                 best_validation = validation;
-                best_strengths = agent.simulator().state().connection_strengths;
+                best_strengths = agent.copy_connection_strengths();
                 best_episode = final_episode;
                 has_validation = true;
             }
@@ -656,11 +747,8 @@ int main(int argc, char** argv)
             agent.load_connection_strengths(best_strengths);
         }
 
-        save_brain_checkpoint(
-            options.save_path,
-            agent.seed(),
-            agent.simulator().model(),
-            agent.simulator().state());
+        const vector<float> saved_strengths = agent.copy_connection_strengths();
+        save_brain_checkpoint(options.save_path, agent.seed(), agent.model(), saved_strengths);
         cout << "{\"phase\":\"checkpoint\",\"path\":\""
             << options.save_path.generic_string() << "\""
             << ",\"selected_episode\":" << best_episode

@@ -620,6 +620,34 @@ void validate_brain_model(const BrainModel& model)
         "brain refractory tick count is inconsistent");
 }
 
+// validates learned strengths and every source-owned outgoing budget
+void validate_connection_strengths(const BrainModel& model, span<const float> strengths)
+{
+    validate_brain_model(model);
+    const size_t neuron_count = model.positions.size();
+    const size_t edge_count = model.outgoing_targets.size();
+    require(strengths.size() == edge_count, "brain connection strength state size is invalid");
+
+    for (uint32_t source = 0; source < neuron_count; ++source)
+    {
+        float strength_sum = 0.0f;
+
+        for (uint32_t edge = model.outgoing_offsets[source];
+            edge < model.outgoing_offsets[source + 1U]; ++edge)
+        {
+            const float strength = strengths[edge];
+            require(finite(strength) && strength >= 0.0f,
+                "brain state contains an invalid connection strength");
+            strength_sum += strength;
+        }
+
+        const float tolerance = max(1.0f, model.config.plasticity.outgoing_strength_budget) * 1.0e-5f;
+        require(finite(strength_sum)
+            && strength_sum <= model.config.plasticity.outgoing_strength_budget + tolerance,
+            "brain state exceeds an outgoing connection budget");
+    }
+}
+
 // validates mutable arrays and outgoing strength budgets
 void validate_brain_state(const BrainModel& model, const BrainState& state)
 {
@@ -629,8 +657,6 @@ void validate_brain_state(const BrainModel& model, const BrainState& state)
     require(state.membrane_potentials.size() == neuron_count,
         "brain membrane state size is invalid");
     require(state.activity_traces.size() == neuron_count, "brain activity trace state size is invalid");
-    require(state.connection_strengths.size() == edge_count,
-        "brain connection strength state size is invalid");
     require(state.connection_eligibilities.size() == edge_count,
         "brain connection eligibility state size is invalid");
     require(state.refractory_ticks.size() == neuron_count, "brain refractory state size is invalid");
@@ -661,27 +687,14 @@ void validate_brain_state(const BrainModel& model, const BrainState& state)
         }
     }
 
-    for (uint32_t source = 0; source < neuron_count; ++source)
+    validate_connection_strengths(model, state.connection_strengths);
+
+    for (uint32_t edge = 0; edge < edge_count; ++edge)
     {
-        float strength_sum = 0.0f;
-
-        for (uint32_t edge = model.outgoing_offsets[source];
-            edge < model.outgoing_offsets[source + 1U]; ++edge)
-        {
-            const float strength = state.connection_strengths[edge];
-            const float eligibility = state.connection_eligibilities[edge];
-            require(finite(strength) && strength >= 0.0f,
-                "brain state contains an invalid connection strength");
-            require(finite(eligibility) && eligibility >= 0.0f
-                && eligibility <= model.config.plasticity.maximum_eligibility,
-                "brain state contains an invalid connection eligibility");
-            strength_sum += strength;
-        }
-
-        const float tolerance = max(1.0f, model.config.plasticity.outgoing_strength_budget) * 1.0e-5f;
-        require(finite(strength_sum)
-            && strength_sum <= model.config.plasticity.outgoing_strength_budget + tolerance,
-            "brain state exceeds an outgoing connection budget");
+        const float eligibility = state.connection_eligibilities[edge];
+        require(finite(eligibility) && eligibility >= 0.0f
+            && eligibility <= model.config.plasticity.maximum_eligibility,
+            "brain state contains an invalid connection eligibility");
     }
 }
 

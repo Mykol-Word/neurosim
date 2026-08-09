@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace neurosim
@@ -140,6 +141,9 @@ BrainState make_brain_state(const BrainModel& model);
 
 // validates compiled topology, interfaces, and initial strengths
 void validate_brain_model(const BrainModel& model);
+
+// validates learned strengths and every source-owned outgoing budget
+void validate_connection_strengths(const BrainModel& model, span<const float> strengths);
 
 // validates mutable arrays and outgoing strength budgets
 void validate_brain_state(const BrainModel& model, const BrainState& state);

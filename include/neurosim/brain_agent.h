@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace neurosim
@@ -51,8 +52,8 @@ struct BrainAgentStatus
     Action network_action = Action::None;
     Action exploration_action = Action::None;
     array<float, 4> output_activity{};
-    uint32_t brain_spikes = 0;
-    uint32_t output_spikes = 0;
+    uint64_t brain_spikes = 0;
+    uint64_t output_spikes = 0;
     uint32_t visible_pellets = 0;
     float applied_modulator = 0.0f;
     bool exploring = false;
@@ -72,7 +73,9 @@ public:
     BrainAgent(
         const EnvironmentConfig& environment_config,
         BrainAgentConfig config = {},
-        uint64_t seed = 1);
+        uint64_t seed = 1,
+        BrainExecutionConfig execution = {},
+        BrainSimulatorFactory simulator_factory = nullptr);
 
     // observes the current environment and returns one simultaneous movement action
     Action decide(const Environment& environment);
@@ -91,6 +94,12 @@ public:
 
     // replaces learned strengths after validating them against this brain
     void load_connection_strengths(span<const float> strengths);
+
+    // returns a host copy of the learned connection strengths
+    vector<float> copy_connection_strengths() const;
+
+    // returns a full host snapshot for diagnostics outside the hot path
+    BrainState copy_state() const;
 
     // returns the fixed construction seed for this brain
     uint64_t seed() const;
@@ -116,8 +125,11 @@ public:
     // returns the task-neutral adaptive controller
     const AdaptiveController& controller() const;
 
-    // returns the cpu brain simulator for recording and inspection
-    const CpuBrainSimulator& simulator() const;
+    // returns the immutable compiled brain model
+    const BrainModel& model() const;
+
+    // returns the explicit execution backend
+    BrainBackend backend() const;
 
 private:
     EnvironmentConfig environment_config_;
@@ -129,6 +141,9 @@ private:
     uint64_t wall_feedback_cooldown_ = 0;
     AgentObservation observation_;
     vector<float> normalized_inputs_;
+    vector<Vec2> wall_ray_directions_;
+    vector<pair<float, float>> wall_ray_intervals_;
+    vector<pair<float, uint32_t>> visible_pellets_;
     AdaptiveController controller_;
     BrainAgentStatus status_;
 };

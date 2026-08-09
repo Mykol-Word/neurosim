@@ -1,6 +1,7 @@
 #include "neurosim/brain.h"
 #include "neurosim/cpu_brain.h"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -353,6 +354,61 @@ void test_one_tick_signal_delay()
     check(!simulator.output_spike(0), "target received a same-tick recurrent signal");
     step_with(simulator, {0.0f});
     check(simulator.output_spike(0), "target did not receive the prior-tick recurrent signal");
+}
+
+// verifies batched cpu execution matches repeated fixed-tick calls exactly
+void test_batched_advance_matches_repeated_steps()
+{
+    BrainConfig config = make_test_config();
+    config.plasticity.learning_rate = 0.1f;
+    config.plasticity.weakening_rate_per_second = 0.02f;
+    config.plasticity.initial_budget_fraction = 0.5f;
+    config.plasticity.initial_connection_density = 1.0f;
+    const BrainModel model = build_brain_model(make_pair_layout(), config, 31);
+    CpuBrainSimulator repeated(model);
+    CpuBrainSimulator batched(model);
+    const array<float, 1> inputs{1000.0f};
+    BrainAdvanceSummary expected;
+
+    for (uint32_t tick = 0; tick < 4U; ++tick)
+    {
+        repeated.step(inputs);
+
+        for (const uint8_t spike : repeated.state().spikes)
+        {
+            expected.neuron_spikes += spike;
+        }
+
+        for (const uint32_t output : model.output_neurons)
+        {
+            expected.output_spikes += repeated.state().spikes[output];
+        }
+    }
+
+    vector<float> output_activity(model.output_neurons.size());
+    const BrainAdvanceSummary actual = batched.advance(inputs, 4U, {}, true, output_activity);
+    const BrainState& expected_state = repeated.state();
+    const BrainState& actual_state = batched.state();
+    check(actual.neuron_spikes == expected.neuron_spikes
+            && actual.output_spikes == expected.output_spikes,
+        "batched cpu execution reported incorrect spike totals");
+    check(actual_state.membrane_potentials == expected_state.membrane_potentials
+            && actual_state.activity_traces == expected_state.activity_traces
+            && actual_state.connection_strengths == expected_state.connection_strengths
+            && actual_state.connection_eligibilities == expected_state.connection_eligibilities
+            && actual_state.refractory_ticks == expected_state.refractory_ticks
+            && actual_state.spikes == expected_state.spikes
+            && actual_state.tick == expected_state.tick,
+        "batched cpu execution changed fixed-tick model state");
+
+    for (uint32_t output = 0; output < output_activity.size(); ++output)
+    {
+        check_near(
+            output_activity[output],
+            expected_state.activity_traces[model.output_neurons[output]],
+            0.0f,
+            "batched cpu execution returned incorrect output activity");
+    }
 }
 
 // verifies inhibitory source polarity subtracts from target potential
@@ -805,6 +861,7 @@ int main()
         {"leaky_integration_and_bias", test_leaky_integration_and_bias},
         {"threshold_reset_and_refractory", test_threshold_reset_and_refractory},
         {"one_tick_signal_delay", test_one_tick_signal_delay},
+        {"batched_advance_matches_repeated_steps", test_batched_advance_matches_repeated_steps},
         {"inhibitory_signal_sign", test_inhibitory_signal_sign},
         {"causal_eligibility_direction", test_causal_eligibility_direction},
         {"inhibitory_plasticity_is_fixed", test_inhibitory_plasticity_is_fixed},

@@ -82,7 +82,7 @@ void test_checkpoint_round_trip()
     }
 
     const TemporaryCheckpoint file;
-    save_brain_checkpoint(file.path(), BRAIN_SEED, model, state);
+    save_brain_checkpoint(file.path(), BRAIN_SEED, model, state.connection_strengths);
     const BrainCheckpoint checkpoint = load_brain_checkpoint(file.path());
     validate_brain_checkpoint(checkpoint, BRAIN_SEED, model);
     check(checkpoint.connection_strengths == state.connection_strengths,
@@ -96,7 +96,7 @@ void test_checkpoint_rejects_model_mismatch()
     const BrainModel model = make_model(11);
     const BrainState state = make_brain_state(model);
     const TemporaryCheckpoint file;
-    save_brain_checkpoint(file.path(), BRAIN_SEED, model, state);
+    save_brain_checkpoint(file.path(), BRAIN_SEED, model, state.connection_strengths);
     const BrainCheckpoint checkpoint = load_brain_checkpoint(file.path());
     bool threw = false;
 
@@ -119,14 +119,14 @@ void test_checkpoint_replaces_existing_file()
     const BrainModel model = make_model(23);
     BrainState state = make_brain_state(model);
     const TemporaryCheckpoint file;
-    save_brain_checkpoint(file.path(), BRAIN_SEED, model, state);
+    save_brain_checkpoint(file.path(), BRAIN_SEED, model, state.connection_strengths);
 
     for (float& strength : state.connection_strengths)
     {
         strength *= 0.25f;
     }
 
-    save_brain_checkpoint(file.path(), BRAIN_SEED, model, state);
+    save_brain_checkpoint(file.path(), BRAIN_SEED, model, state.connection_strengths);
     const BrainCheckpoint checkpoint = load_brain_checkpoint(file.path());
     check(checkpoint.connection_strengths == state.connection_strengths,
         "replacement checkpoint retained stale strengths");

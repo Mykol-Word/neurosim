@@ -4,7 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <exception>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -19,7 +19,7 @@ using namespace std;
 namespace
 {
 
-inline constexpr uint32_t CUDA_THREADS_PER_BLOCK = 256U;
+inline constexpr uint32_t CUDA_THREADS_PER_BLOCK = 128U;
 
 // mixes a neuron, tick, and perturbation seed into a stable random value
 __device__ uint64_t mix_noise(uint64_t value)
@@ -117,8 +117,8 @@ public:
         }
     }
 
-    // uploads a complete host span into the buffer
-    void upload(span<const T> values)
+    // queues one complete host upload on the supplied cuda stream
+    void upload_async(span<const T> values, cudaStream_t stream)
     {
         if (values.size() != size_)
         {
@@ -127,8 +127,13 @@ public:
 
         if (size_ > 0U)
         {
-            check_cuda(cudaMemcpy(pointer_, values.data(), sizeof(T) * size_, cudaMemcpyHostToDevice),
-                "upload CUDA brain buffer");
+            check_cuda(cudaMemcpyAsync(
+                pointer_,
+                values.data(),
+                sizeof(T) * size_,
+                cudaMemcpyHostToDevice,
+                stream),
+                "queue CUDA brain upload");
         }
     }
 
@@ -147,12 +152,33 @@ public:
         }
     }
 
-    // fills the device allocation with zero bytes
-    void clear()
+    // queues a device prefix download on the supplied cuda stream
+    void download_prefix_async(span<T> values, cudaStream_t stream) const
+    {
+        if (values.size() > size_)
+        {
+            throw invalid_argument("CUDA brain download exceeds device buffer");
+        }
+
+        if (!values.empty())
+        {
+            check_cuda(cudaMemcpyAsync(
+                values.data(),
+                pointer_,
+                sizeof(T) * values.size(),
+                cudaMemcpyDeviceToHost,
+                stream),
+                "queue CUDA brain download");
+        }
+    }
+
+    // queues a zero fill on the supplied cuda stream
+    void clear_async(cudaStream_t stream)
     {
         if (size_ > 0U)
         {
-            check_cuda(cudaMemset(pointer_, 0, sizeof(T) * size_), "clear CUDA brain buffer");
+            check_cuda(cudaMemsetAsync(pointer_, 0, sizeof(T) * size_, stream),
+                "queue CUDA brain buffer clear");
         }
     }
 
@@ -175,22 +201,129 @@ public:
     }
 
 private:
-    // releases the current allocation without surfacing destructor failures
+    // releases the current allocation while preserving any active exception
     void release() noexcept
     {
         if (pointer_ != nullptr)
         {
-            if (cudaFree(pointer_) != cudaSuccess)
-            {
-                terminate();
-            }
-
+            static_cast<void>(cudaFree(pointer_));
             pointer_ = nullptr;
         }
 
         size_ = 0U;
     }
 
+    T* pointer_ = nullptr;
+    size_t size_ = 0U;
+};
+
+// owns one nonblocking cuda stream and restores its device before cleanup
+class CudaStream
+{
+public:
+    // creates an empty stream owner
+    CudaStream() = default;
+
+    // releases the stream without allowing destructor failures to escape
+    ~CudaStream()
+    {
+        release();
+    }
+
+    // prevents duplicate ownership of one cuda stream
+    CudaStream(const CudaStream&) = delete;
+
+    // prevents duplicate ownership of one cuda stream
+    CudaStream& operator=(const CudaStream&) = delete;
+
+    // creates one nonblocking stream on the requested device
+    void create(int32_t device)
+    {
+        if (stream_ != nullptr)
+        {
+            throw logic_error("CUDA brain stream is already created");
+        }
+
+        check_cuda(cudaSetDevice(device), "select CUDA brain device");
+        check_cuda(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking),
+            "create CUDA brain stream");
+        device_ = device;
+    }
+
+    // returns the owned cuda stream handle
+    cudaStream_t get() const
+    {
+        return stream_;
+    }
+
+private:
+    // destroys the stream while preserving any active exception
+    void release() noexcept
+    {
+        if (stream_ == nullptr)
+        {
+            return;
+        }
+
+        if (cudaSetDevice(device_) == cudaSuccess)
+        {
+            static_cast<void>(cudaStreamDestroy(stream_));
+        }
+
+        stream_ = nullptr;
+    }
+
+    cudaStream_t stream_ = nullptr;
+    int32_t device_ = 0;
+};
+
+template<typename T>
+// owns one reusable page-locked host allocation for asynchronous transfers
+class PinnedBuffer
+{
+public:
+    // creates an empty pinned host buffer
+    PinnedBuffer() = default;
+
+    // releases the pinned host allocation without throwing
+    ~PinnedBuffer()
+    {
+        if (pointer_ != nullptr)
+        {
+            static_cast<void>(cudaFreeHost(pointer_));
+        }
+    }
+
+    // prevents duplicate ownership of pinned host memory
+    PinnedBuffer(const PinnedBuffer&) = delete;
+
+    // prevents duplicate ownership of pinned host memory
+    PinnedBuffer& operator=(const PinnedBuffer&) = delete;
+
+    // allocates the pinned buffer exactly once
+    void allocate(size_t size)
+    {
+        if (pointer_ != nullptr || size_ != 0U)
+        {
+            throw logic_error("pinned buffer is already allocated");
+        }
+
+        size_ = size;
+
+        if (size_ > 0U)
+        {
+            check_cuda(cudaMallocHost(reinterpret_cast<void**>(&pointer_), sizeof(T) * size_),
+                "allocate CUDA brain result buffer");
+        }
+    }
+
+    // returns the mutable pinned host pointer
+    T* data()
+    {
+        return pointer_;
+    }
+
+private:
     T* pointer_ = nullptr;
     size_t size_ = 0U;
 };
@@ -212,6 +345,16 @@ struct DeviceBrainConfig
     uint32_t refractory_ticks;
 };
 
+// stores one batched advance result and its numerical error code
+struct DeviceAdvanceReport
+{
+    unsigned long long neuron_spikes;
+    unsigned long long output_spikes;
+    int32_t error;
+};
+
+static_assert(sizeof(DeviceAdvanceReport) % alignof(float) == 0U);
+
 // advances independent neuron state from prior spikes and current strengths
 __global__ void advance_neurons_kernel(
     uint32_t neuron_count,
@@ -227,7 +370,7 @@ __global__ void advance_neurons_kernel(
     uint8_t* next_spikes,
     float* membrane_potentials,
     uint32_t* refractory_ticks,
-    int32_t* error_flag,
+    DeviceAdvanceReport* report,
     uint64_t tick,
     uint64_t noise_seed,
     float noise_amplitude,
@@ -281,7 +424,7 @@ __global__ void advance_neurons_kernel(
 
         if (!isfinite(next_potential))
         {
-            atomicCAS(error_flag, 0, 1);
+            atomicCAS(&report->error, 0, 1);
         }
         else if (next_potential >= config.firing_threshold)
         {
@@ -305,10 +448,11 @@ __global__ void update_plasticity_and_traces_kernel(
     const uint32_t* outgoing_targets,
     const int8_t* polarities,
     const uint8_t* spikes,
+    uint32_t* spike_counts,
     float* activity_traces,
     float* connection_strengths,
     float* connection_eligibilities,
-    int32_t* error_flag,
+    DeviceAdvanceReport* report,
     bool plasticity_enabled,
     DeviceBrainConfig config)
 {
@@ -335,7 +479,7 @@ __global__ void update_plasticity_and_traces_kernel(
             if (!isfinite(strength) || strength < 0.0f
                 || !isfinite(eligibility) || eligibility < 0.0f)
             {
-                atomicCAS(error_flag, 0, 2);
+                atomicCAS(&report->error, 0, 2);
             }
 
             connection_strengths[edge] = strength;
@@ -346,10 +490,64 @@ __global__ void update_plasticity_and_traces_kernel(
     const float trace = old_source_activity * config.trace_decay
         + static_cast<float>(spikes[source]);
     activity_traces[source] = trace;
+    spike_counts[source] += static_cast<uint32_t>(spikes[source]);
 
     if (!isfinite(trace))
     {
-        atomicCAS(error_flag, 0, 3);
+        atomicCAS(&report->error, 0, 3);
+    }
+}
+
+// reduces per-neuron spike totals into one compact batch report
+__global__ void summarize_spikes_kernel(
+    uint32_t neuron_count,
+    const uint32_t* spike_counts,
+    const uint8_t* output_flags,
+    DeviceAdvanceReport* report)
+{
+    __shared__ unsigned long long neuron_spikes[CUDA_THREADS_PER_BLOCK];
+    __shared__ unsigned long long output_spikes[CUDA_THREADS_PER_BLOCK];
+
+    const uint32_t neuron = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long spikes = neuron < neuron_count
+        ? static_cast<unsigned long long>(spike_counts[neuron])
+        : 0ULL;
+    neuron_spikes[threadIdx.x] = spikes;
+    output_spikes[threadIdx.x] = neuron < neuron_count && output_flags[neuron] != 0U
+        ? spikes
+        : 0ULL;
+    __syncthreads();
+
+    for (uint32_t offset = CUDA_THREADS_PER_BLOCK / 2U; offset > 0U; offset /= 2U)
+    {
+        if (threadIdx.x < offset)
+        {
+            neuron_spikes[threadIdx.x] += neuron_spikes[threadIdx.x + offset];
+            output_spikes[threadIdx.x] += output_spikes[threadIdx.x + offset];
+        }
+
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0U)
+    {
+        atomicAdd(&report->neuron_spikes, neuron_spikes[0]);
+        atomicAdd(&report->output_spikes, output_spikes[0]);
+    }
+}
+
+// gathers ordered output traces into one contiguous transfer buffer
+__global__ void gather_output_activity_kernel(
+    uint32_t output_count,
+    const uint32_t* output_neurons,
+    const float* activity_traces,
+    float* output_activity)
+{
+    const uint32_t output = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (output < output_count)
+    {
+        output_activity[output] = activity_traces[output_neurons[output]];
     }
 }
 
@@ -359,7 +557,7 @@ __global__ void modulate_connections_kernel(
     const uint32_t* outgoing_offsets,
     float* connection_strengths,
     float* connection_eligibilities,
-    int32_t* error_flag,
+    DeviceAdvanceReport* report,
     float modulator,
     DeviceBrainConfig config)
 {
@@ -379,7 +577,7 @@ __global__ void modulate_connections_kernel(
 
         if (!isfinite(delta) || !isfinite(raw_strength))
         {
-            atomicCAS(error_flag, 0, 4);
+            atomicCAS(&report->error, 0, 4);
         }
 
         const float strength = fmaxf(0.0f, raw_strength);
@@ -390,7 +588,7 @@ __global__ void modulate_connections_kernel(
 
     if (!isfinite(strength_sum))
     {
-        atomicCAS(error_flag, 0, 5);
+        atomicCAS(&report->error, 0, 5);
         return;
     }
 
@@ -452,6 +650,7 @@ public:
         }
 
         activate_device();
+        stream_.create(device_);
         outgoing_offsets_.allocate(model_.outgoing_offsets.size());
         outgoing_targets_.allocate(model_.outgoing_targets.size());
         edge_sources_.allocate(model_.edge_sources.size());
@@ -461,6 +660,8 @@ public:
         bias_drives_.allocate(model_.bias_drives.size());
         input_slots_.allocate(model_.input_slots_by_neuron.size());
         input_drives_.allocate(model_.input_neurons.size());
+        output_flags_.allocate(model_.positions.size());
+        output_neurons_.allocate(model_.output_neurons.size());
         membrane_potentials_.allocate(model_.positions.size());
         activity_traces_.allocate(model_.positions.size());
         connection_strengths_.allocate(model_.outgoing_targets.size());
@@ -468,12 +669,16 @@ public:
         refractory_ticks_.allocate(model_.positions.size());
         previous_spikes_.allocate(model_.positions.size());
         next_spikes_.allocate(model_.positions.size());
-        error_flag_.allocate(1U);
-        outgoing_offsets_.upload(model_.outgoing_offsets);
-        outgoing_targets_.upload(model_.outgoing_targets);
-        edge_sources_.upload(model_.edge_sources);
-        incoming_offsets_.upload(model_.incoming_offsets);
-        incoming_edges_.upload(model_.incoming_edges);
+        spike_counts_.allocate(model_.positions.size());
+        const size_t result_bytes = sizeof(DeviceAdvanceReport)
+            + sizeof(float) * model_.output_neurons.size();
+        advance_result_.allocate(result_bytes);
+        host_advance_result_.allocate(result_bytes);
+        outgoing_offsets_.upload_async(model_.outgoing_offsets, stream_.get());
+        outgoing_targets_.upload_async(model_.outgoing_targets, stream_.get());
+        edge_sources_.upload_async(model_.edge_sources, stream_.get());
+        incoming_offsets_.upload_async(model_.incoming_offsets, stream_.get());
+        incoming_edges_.upload_async(model_.incoming_edges, stream_.get());
         vector<int8_t> polarities(model_.polarities.size());
 
         for (size_t index = 0; index < model_.polarities.size(); ++index)
@@ -481,9 +686,19 @@ public:
             polarities[index] = static_cast<int8_t>(model_.polarities[index]);
         }
 
-        polarities_.upload(polarities);
-        bias_drives_.upload(model_.bias_drives);
-        input_slots_.upload(model_.input_slots_by_neuron);
+        polarities_.upload_async(polarities, stream_.get());
+        bias_drives_.upload_async(model_.bias_drives, stream_.get());
+        input_slots_.upload_async(model_.input_slots_by_neuron, stream_.get());
+        vector<uint8_t> output_flags(model_.positions.size(), 0U);
+
+        for (const uint32_t output_neuron : model_.output_neurons)
+        {
+            output_flags[output_neuron] = 1U;
+        }
+
+        output_flags_.upload_async(output_flags, stream_.get());
+        output_neurons_.upload_async(model_.output_neurons, stream_.get());
+        check_cuda(cudaStreamSynchronize(stream_.get()), "upload CUDA brain model");
         reset();
     }
 
@@ -511,11 +726,13 @@ public:
         upload_state(state, true);
     }
 
-    // advances the device state through both synchronized model phases
-    void step(
+    // advances fixed ticks while synchronizing with the host only once
+    BrainAdvanceSummary advance(
         span<const float> input_drives,
+        uint32_t tick_count,
         BrainPerturbation perturbation,
-        bool plasticity_enabled)
+        bool plasticity_enabled,
+        span<float> output_activity)
     {
         if (requires_reset_)
         {
@@ -525,6 +742,16 @@ public:
         if (input_drives.size() != model_.input_neurons.size())
         {
             throw invalid_argument("brain input count does not match the configured input channels");
+        }
+
+        if (tick_count == 0U)
+        {
+            throw invalid_argument("brain advance tick count must be positive");
+        }
+
+        if (!output_activity.empty() && output_activity.size() != model_.output_neurons.size())
+        {
+            throw invalid_argument("brain output activity count does not match the configured outputs");
         }
 
         for (const float input : input_drives)
@@ -541,7 +768,7 @@ public:
             throw invalid_argument("brain perturbation amplitude must be finite and nonnegative");
         }
 
-        if (tick_ == numeric_limits<uint64_t>::max())
+        if (tick_count > numeric_limits<uint64_t>::max() - tick_)
         {
             throw overflow_error("brain tick counter overflow");
         }
@@ -549,61 +776,114 @@ public:
         try
         {
             activate_device();
-            input_drives_.upload(input_drives);
-            error_flag_.clear();
+            input_drives_.upload_async(input_drives, stream_.get());
+            spike_counts_.clear_async(stream_.get());
+            advance_result_.clear_async(stream_.get());
+            DeviceAdvanceReport* report = reinterpret_cast<DeviceAdvanceReport*>(
+                advance_result_.data());
             const uint32_t neuron_count = static_cast<uint32_t>(model_.positions.size());
             const uint32_t blocks = (neuron_count + CUDA_THREADS_PER_BLOCK - 1U)
                 / CUDA_THREADS_PER_BLOCK;
-            advance_neurons_kernel<<<blocks, CUDA_THREADS_PER_BLOCK>>>(
-                neuron_count,
-                incoming_offsets_.data(),
-                incoming_edges_.data(),
-                edge_sources_.data(),
-                polarities_.data(),
-                bias_drives_.data(),
-                input_slots_.data(),
-                input_drives_.data(),
-                connection_strengths_.data(),
-                previous_spikes_.data(),
-                next_spikes_.data(),
-                membrane_potentials_.data(),
-                refractory_ticks_.data(),
-                error_flag_.data(),
-                tick_,
-                perturbation.noise_seed,
-                perturbation.noise_drive_amplitude,
-                config_);
-            check_cuda(cudaGetLastError(), "launch CUDA neuron update");
-            update_plasticity_and_traces_kernel<<<blocks, CUDA_THREADS_PER_BLOCK>>>(
-                neuron_count,
-                outgoing_offsets_.data(),
-                outgoing_targets_.data(),
-                polarities_.data(),
-                next_spikes_.data(),
-                activity_traces_.data(),
-                connection_strengths_.data(),
-                connection_eligibilities_.data(),
-                error_flag_.data(),
-                plasticity_enabled,
-                config_);
-            check_cuda(cudaGetLastError(), "launch CUDA plasticity and trace update");
-            check_cuda(cudaDeviceSynchronize(), "synchronize CUDA brain step");
-            int32_t error = 0;
-            error_flag_.download(span<int32_t>(&error, 1U));
 
-            if (error != 0)
+            for (uint32_t tick = 0; tick < tick_count; ++tick)
             {
-                throw runtime_error("CUDA brain step produced invalid numerical state");
+                advance_neurons_kernel<<<blocks, CUDA_THREADS_PER_BLOCK, 0, stream_.get()>>>(
+                    neuron_count,
+                    incoming_offsets_.data(),
+                    incoming_edges_.data(),
+                    edge_sources_.data(),
+                    polarities_.data(),
+                    bias_drives_.data(),
+                    input_slots_.data(),
+                    input_drives_.data(),
+                    connection_strengths_.data(),
+                    previous_spikes_.data(),
+                    next_spikes_.data(),
+                    membrane_potentials_.data(),
+                    refractory_ticks_.data(),
+                    report,
+                    tick_ + tick,
+                    perturbation.noise_seed,
+                    perturbation.noise_drive_amplitude,
+                    config_);
+                check_cuda(cudaGetLastError(), "launch CUDA neuron update");
+                update_plasticity_and_traces_kernel<<<
+                    blocks,
+                    CUDA_THREADS_PER_BLOCK,
+                    0,
+                    stream_.get()>>>(
+                    neuron_count,
+                    outgoing_offsets_.data(),
+                    outgoing_targets_.data(),
+                    polarities_.data(),
+                    next_spikes_.data(),
+                    spike_counts_.data(),
+                    activity_traces_.data(),
+                    connection_strengths_.data(),
+                    connection_eligibilities_.data(),
+                    report,
+                    plasticity_enabled,
+                    config_);
+                check_cuda(cudaGetLastError(), "launch CUDA plasticity and trace update");
+                swap(previous_spikes_, next_spikes_);
             }
+
+            summarize_spikes_kernel<<<blocks, CUDA_THREADS_PER_BLOCK, 0, stream_.get()>>>(
+                neuron_count,
+                spike_counts_.data(),
+                output_flags_.data(),
+                report);
+            check_cuda(cudaGetLastError(), "launch CUDA spike summary");
+
+            if (!output_activity.empty())
+            {
+                const uint32_t output_count = static_cast<uint32_t>(model_.output_neurons.size());
+                const uint32_t output_blocks = (output_count + CUDA_THREADS_PER_BLOCK - 1U)
+                    / CUDA_THREADS_PER_BLOCK;
+                float* device_output_activity = reinterpret_cast<float*>(
+                    advance_result_.data() + sizeof(DeviceAdvanceReport));
+                gather_output_activity_kernel<<<
+                    output_blocks,
+                    CUDA_THREADS_PER_BLOCK,
+                    0,
+                    stream_.get()>>>(
+                    output_count,
+                    output_neurons_.data(),
+                    activity_traces_.data(),
+                    device_output_activity);
+                check_cuda(cudaGetLastError(), "launch CUDA output activity gather");
+            }
+
+            const size_t result_bytes = sizeof(DeviceAdvanceReport)
+                + sizeof(float) * output_activity.size();
+            advance_result_.download_prefix_async(
+                span<uint8_t>(host_advance_result_.data(), result_bytes),
+                stream_.get());
+            check_cuda(cudaStreamSynchronize(stream_.get()), "synchronize CUDA brain advance");
+            DeviceAdvanceReport host_report{};
+            memcpy(&host_report, host_advance_result_.data(), sizeof(host_report));
+
+            if (host_report.error != 0)
+            {
+                throw runtime_error("CUDA brain advance produced invalid numerical state");
+            }
+
+            if (!output_activity.empty())
+            {
+                memcpy(
+                    output_activity.data(),
+                    host_advance_result_.data() + sizeof(DeviceAdvanceReport),
+                    output_activity.size_bytes());
+            }
+
+            tick_ += tick_count;
+            return {host_report.neuron_spikes, host_report.output_spikes};
         }
         catch (...)
         {
             requires_reset_ = true;
             throw;
         }
-
-        swap(previous_spikes_, next_spikes_);
-        ++tick_;
     }
 
     // applies one signed global event to eligible local connections
@@ -627,24 +907,30 @@ public:
         try
         {
             activate_device();
-            error_flag_.clear();
+            advance_result_.clear_async(stream_.get());
+            DeviceAdvanceReport* report = reinterpret_cast<DeviceAdvanceReport*>(
+                advance_result_.data());
             const uint32_t neuron_count = static_cast<uint32_t>(model_.positions.size());
             const uint32_t blocks = (neuron_count + CUDA_THREADS_PER_BLOCK - 1U)
                 / CUDA_THREADS_PER_BLOCK;
-            modulate_connections_kernel<<<blocks, CUDA_THREADS_PER_BLOCK>>>(
+            modulate_connections_kernel<<<blocks, CUDA_THREADS_PER_BLOCK, 0, stream_.get()>>>(
                 neuron_count,
                 outgoing_offsets_.data(),
                 connection_strengths_.data(),
                 connection_eligibilities_.data(),
-                error_flag_.data(),
+                report,
                 modulator,
                 config_);
             check_cuda(cudaGetLastError(), "launch CUDA plasticity modulation");
-            check_cuda(cudaDeviceSynchronize(), "synchronize CUDA plasticity modulation");
-            int32_t error = 0;
-            error_flag_.download(span<int32_t>(&error, 1U));
+            advance_result_.download_prefix_async(
+                span<uint8_t>(host_advance_result_.data(), sizeof(DeviceAdvanceReport)),
+                stream_.get());
+            check_cuda(cudaStreamSynchronize(stream_.get()),
+                "synchronize CUDA plasticity modulation");
+            DeviceAdvanceReport host_report{};
+            memcpy(&host_report, host_advance_result_.data(), sizeof(host_report));
 
-            if (error != 0)
+            if (host_report.error != 0)
             {
                 throw runtime_error("CUDA brain modulation produced invalid numerical state");
             }
@@ -654,6 +940,24 @@ public:
             requires_reset_ = true;
             throw;
         }
+    }
+
+    // replaces learned strengths and clears transient activity
+    void load_connection_strengths(span<const float> strengths)
+    {
+        validate_connection_strengths(model_, strengths);
+        BrainState state = make_brain_state(model_);
+        state.connection_strengths.assign(strengths.begin(), strengths.end());
+        upload_state(state, true);
+    }
+
+    // returns a host copy of the learned connection strengths
+    vector<float> copy_connection_strengths() const
+    {
+        activate_device();
+        vector<float> strengths(model_.outgoing_targets.size());
+        connection_strengths_.download(strengths);
+        return strengths;
     }
 
     // returns the immutable host copy of the compiled model
@@ -730,17 +1034,21 @@ private:
         try
         {
             activate_device();
-            membrane_potentials_.upload(state.membrane_potentials);
-            activity_traces_.upload(state.activity_traces);
-            refractory_ticks_.upload(state.refractory_ticks);
-            previous_spikes_.upload(state.spikes);
-            next_spikes_.clear();
-            connection_eligibilities_.upload(state.connection_eligibilities);
+            membrane_potentials_.upload_async(state.membrane_potentials, stream_.get());
+            activity_traces_.upload_async(state.activity_traces, stream_.get());
+            refractory_ticks_.upload_async(state.refractory_ticks, stream_.get());
+            previous_spikes_.upload_async(state.spikes, stream_.get());
+            next_spikes_.clear_async(stream_.get());
+            connection_eligibilities_.upload_async(
+                state.connection_eligibilities,
+                stream_.get());
 
             if (include_strengths)
             {
-                connection_strengths_.upload(state.connection_strengths);
+                connection_strengths_.upload_async(state.connection_strengths, stream_.get());
             }
+
+            check_cuda(cudaStreamSynchronize(stream_.get()), "upload CUDA brain state");
         }
         catch (...)
         {
@@ -764,6 +1072,8 @@ private:
     DeviceBuffer<float> bias_drives_;
     DeviceBuffer<int32_t> input_slots_;
     DeviceBuffer<float> input_drives_;
+    DeviceBuffer<uint8_t> output_flags_;
+    DeviceBuffer<uint32_t> output_neurons_;
     DeviceBuffer<float> membrane_potentials_;
     DeviceBuffer<float> activity_traces_;
     DeviceBuffer<float> connection_strengths_;
@@ -771,9 +1081,12 @@ private:
     DeviceBuffer<uint32_t> refractory_ticks_;
     DeviceBuffer<uint8_t> previous_spikes_;
     DeviceBuffer<uint8_t> next_spikes_;
-    DeviceBuffer<int32_t> error_flag_;
+    DeviceBuffer<uint32_t> spike_counts_;
+    DeviceBuffer<uint8_t> advance_result_;
+    PinnedBuffer<uint8_t> host_advance_result_;
     uint64_t tick_ = 0;
     bool requires_reset_ = false;
+    CudaStream stream_;
 };
 
 // reports whether a numbered cuda device is currently usable
@@ -801,6 +1114,30 @@ bool cuda_device_available(int32_t device)
 
     check_cuda(result, "query CUDA device count");
     return device < device_count;
+}
+
+// returns reproducibility metadata for one usable cuda device
+CudaDeviceInfo cuda_device_info(int32_t device)
+{
+    if (!cuda_device_available(device))
+    {
+        throw runtime_error("requested CUDA brain device is unavailable");
+    }
+
+    cudaDeviceProp properties{};
+    int32_t driver_version = 0;
+    int32_t runtime_version = 0;
+    check_cuda(cudaGetDeviceProperties(&properties, device), "query CUDA device properties");
+    check_cuda(cudaDriverGetVersion(&driver_version), "query CUDA driver version");
+    check_cuda(cudaRuntimeGetVersion(&runtime_version), "query CUDA runtime version");
+    return {
+        properties.name,
+        properties.major,
+        properties.minor,
+        driver_version,
+        runtime_version,
+        CUDART_VERSION
+    };
 }
 
 // uploads a compiled model and fresh state to one cuda device
@@ -836,13 +1173,29 @@ void CudaBrainSimulator::reset(const BrainState& state)
     implementation_->reset(state);
 }
 
-// advances every neuron and optionally records plasticity by one synchronized fixed tick
+// advances every neuron and optionally records plasticity by one fixed tick
 void CudaBrainSimulator::step(
     span<const float> input_drives,
     BrainPerturbation perturbation,
     bool plasticity_enabled)
 {
-    implementation_->step(input_drives, perturbation, plasticity_enabled);
+    advance(input_drives, 1U, perturbation, plasticity_enabled, {});
+}
+
+// advances multiple fixed ticks with one host-device synchronization
+BrainAdvanceSummary CudaBrainSimulator::advance(
+    span<const float> input_drives,
+    uint32_t tick_count,
+    BrainPerturbation perturbation,
+    bool plasticity_enabled,
+    span<float> output_activity)
+{
+    return implementation_->advance(
+        input_drives,
+        tick_count,
+        perturbation,
+        plasticity_enabled,
+        output_activity);
 }
 
 // applies one signed global event to eligible local connections
@@ -851,10 +1204,35 @@ void CudaBrainSimulator::apply_plasticity_modulation(float modulator)
     implementation_->apply_plasticity_modulation(modulator);
 }
 
+// replaces learned strengths and clears transient activity
+void CudaBrainSimulator::load_connection_strengths(span<const float> strengths)
+{
+    implementation_->load_connection_strengths(strengths);
+}
+
+// returns a host copy of the learned connection strengths
+vector<float> CudaBrainSimulator::copy_connection_strengths() const
+{
+    return implementation_->copy_connection_strengths();
+}
+
+// returns a full host snapshot for diagnostics outside the hot path
+BrainState CudaBrainSimulator::copy_state() const
+{
+    return implementation_->download_state();
+}
+
 // returns the immutable host copy of the compiled model
 const BrainModel& CudaBrainSimulator::model() const
 {
     return implementation_->model();
+}
+
+// returns the cuda execution backend
+BrainBackend CudaBrainSimulator::backend() const
+{
+    using enum BrainBackend;
+    return Cuda;
 }
 
 // downloads the complete current device state for inspection or parity tests
@@ -873,6 +1251,31 @@ bool CudaBrainSimulator::output_spike(uint32_t output_channel) const
 float CudaBrainSimulator::output_activity(uint32_t output_channel) const
 {
     return implementation_->output_activity(output_channel);
+}
+
+// creates one cuda simulator for the requested cuda execution configuration
+unique_ptr<BrainSimulator> make_cuda_brain_simulator(
+    BrainModel model,
+    const BrainExecutionConfig& execution)
+{
+    using enum BrainBackend;
+
+    if (execution.backend != Cuda)
+    {
+        throw invalid_argument("cuda brain factory received a non-cuda execution request");
+    }
+
+    if (execution.cuda_device < 0)
+    {
+        throw invalid_argument("CUDA device index must be nonnegative");
+    }
+
+    if (!cuda_device_available(execution.cuda_device))
+    {
+        throw runtime_error("requested CUDA brain device is unavailable");
+    }
+
+    return make_unique<CudaBrainSimulator>(move(model), execution.cuda_device);
 }
 
 }

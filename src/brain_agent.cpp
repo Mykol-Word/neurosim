@@ -31,20 +31,7 @@ inline constexpr array<Action, 8> MOVEMENT_ACTIONS{
     Down | Right
 };
 
-// stores one ray interval inside a navigable floor rectangle
-struct RayInterval
-{
-    float minimum;
-    float maximum;
-};
-
-// stores one visible pellet before stable distance ordering
-struct VisiblePellet
-{
-    uint32_t index;
-    Vec2 offset;
-    float distance_squared;
-};
+using RayInterval = pair<float, float>;
 
 // returns whether a simultaneous action contains one direction
 bool has_action(Action actions, Action direction)
@@ -85,6 +72,22 @@ BrainAgentConfig prepare_agent_config(BrainAgentConfig config)
     }
 
     return config;
+}
+
+// creates fixed north-up ray directions for one observation schema
+vector<Vec2> make_wall_ray_directions(uint32_t wall_ray_count)
+{
+    constexpr float FULL_TURN = 2.0f * numbers::pi_v<float>;
+    vector<Vec2> directions(wall_ray_count);
+
+    for (uint32_t ray = 0; ray < wall_ray_count; ++ray)
+    {
+        const float angle = -numbers::pi_v<float> * 0.5f
+            + FULL_TURN * static_cast<float>(ray) / static_cast<float>(wall_ray_count);
+        directions[ray] = {cos(angle), sin(angle)};
+    }
+
+    return directions;
 }
 
 // converts a positive duration to the first fixed tick meeting it
@@ -194,13 +197,13 @@ bool intersect_ray_axis(
 // returns the first distance at which a ray leaves connected navigable floor
 float navigable_ray_distance(
     const Environment& environment,
-    Vec2 direction)
+    Vec2 direction,
+    vector<RayInterval>& intervals)
 {
     const float radius = environment.config().vision_radius;
     const float inset = environment.config().player_size * 0.5f + NAVIGATION_EPSILON;
     const Vec2 origin = environment.state().position;
-    vector<RayInterval> intervals;
-    intervals.reserve(environment.dungeon().floor_rects.size());
+    intervals.clear();
 
     for (const Rect& floor : environment.dungeon().floor_rects)
     {
@@ -237,7 +240,7 @@ float navigable_ray_distance(
 
     sort(intervals.begin(), intervals.end(), [](RayInterval left, RayInterval right)
     {
-        return left.minimum < right.minimum;
+        return left.first < right.first;
     });
 
     float connected_end = -1.0f;
@@ -246,20 +249,20 @@ float navigable_ray_distance(
     {
         if (connected_end < 0.0f)
         {
-            if (interval.minimum <= NAVIGATION_EPSILON)
+            if (interval.first <= NAVIGATION_EPSILON)
             {
-                connected_end = interval.maximum;
+                connected_end = interval.second;
             }
 
             continue;
         }
 
-        if (interval.minimum > connected_end + NAVIGATION_EPSILON)
+        if (interval.first > connected_end + NAVIGATION_EPSILON)
         {
             break;
         }
 
-        connected_end = max(connected_end, interval.maximum);
+        connected_end = max(connected_end, interval.second);
     }
 
     if (connected_end < 0.0f)
@@ -275,7 +278,16 @@ void flatten_observation(
     const AgentObservation& observation,
     vector<float>& normalized_inputs)
 {
-    fill(normalized_inputs.begin(), normalized_inputs.end(), 0.0f);
+    const size_t expected_inputs = observation.pellets.size() * PELLET_CHANNELS
+        + observation.wall_proximity.size()
+        + observation.velocity.size()
+        + 1U;
+
+    if (expected_inputs != normalized_inputs.size())
+    {
+        throw logic_error("agent observation does not match its brain input count");
+    }
+
     size_t input = 0;
 
     for (const PelletObservation& pellet : observation.pellets)
@@ -298,11 +310,6 @@ void flatten_observation(
     }
 
     normalized_inputs[input++] = observation.hunger;
-
-    if (input != normalized_inputs.size())
-    {
-        throw logic_error("agent observation does not match its brain input count");
-    }
 }
 
 // decodes four anonymous output values through the dungeon action schema
@@ -342,33 +349,43 @@ Action decode_action(span<const float> outputs, float threshold)
     return action;
 }
 
-}
-
-// creates a bounded local observation without rendering dependencies
-AgentObservation observe_environment(
+// updates one observation using reusable ray and pellet scratch storage
+void update_environment_observation(
     const Environment& environment,
     uint32_t pellet_slots,
-    uint32_t wall_ray_count)
+    span<const Vec2> wall_ray_directions,
+    vector<RayInterval>& wall_ray_intervals,
+    vector<pair<float, uint32_t>>& visible_pellets,
+    AgentObservation& observation)
 {
     if (pellet_slots == 0U)
     {
         throw invalid_argument("agent observation requires at least one pellet slot");
     }
 
-    if (wall_ray_count < 4U || wall_ray_count % 4U != 0U)
+    if (wall_ray_directions.size() < 4U || wall_ray_directions.size() % 4U != 0U)
     {
         throw invalid_argument("agent observation wall rays must be a positive multiple of four");
     }
 
-    AgentObservation observation;
     observation.pellets.resize(pellet_slots);
-    observation.wall_proximity.resize(wall_ray_count);
+    fill(observation.pellets.begin(), observation.pellets.end(), PelletObservation{});
+    observation.wall_proximity.resize(wall_ray_directions.size());
     const float radius = environment.config().vision_radius;
     const float radius_squared = radius * radius;
     const EnvironmentState& state = environment.state();
     const Dungeon& dungeon = environment.dungeon();
-    vector<VisiblePellet> visible;
-    visible.reserve(dungeon.pellets.size());
+    visible_pellets.clear();
+
+    if (wall_ray_intervals.capacity() < dungeon.floor_rects.size())
+    {
+        wall_ray_intervals.reserve(dungeon.floor_rects.size());
+    }
+
+    if (visible_pellets.capacity() < dungeon.pellets.size())
+    {
+        visible_pellets.reserve(dungeon.pellets.size());
+    }
 
     for (uint32_t index = 0; index < dungeon.pellets.size(); ++index)
     {
@@ -382,27 +399,23 @@ AgentObservation observe_environment(
 
         if (squared <= radius_squared)
         {
-            visible.push_back({index, offset, squared});
+            visible_pellets.emplace_back(squared, index);
         }
     }
 
-    sort(visible.begin(), visible.end(), [](const VisiblePellet& left, const VisiblePellet& right)
-    {
-        return left.distance_squared == right.distance_squared
-            ? left.index < right.index
-            : left.distance_squared < right.distance_squared;
-    });
+    sort(visible_pellets.begin(), visible_pellets.end());
 
-    if (visible.size() > pellet_slots)
+    if (visible_pellets.size() > pellet_slots)
     {
         throw runtime_error("visible pellet count exceeds the agent observation capacity");
     }
 
-    observation.visible_pellets = static_cast<uint32_t>(visible.size());
+    observation.visible_pellets = static_cast<uint32_t>(visible_pellets.size());
 
-    for (uint32_t slot = 0; slot < visible.size(); ++slot)
+    for (uint32_t slot = 0; slot < visible_pellets.size(); ++slot)
     {
-        const Vec2 offset = visible[slot].offset;
+        const uint32_t pellet_index = visible_pellets[slot].second;
+        const Vec2 offset = dungeon.pellets[pellet_index].position - state.position;
         PelletObservation& pellet = observation.pellets[slot];
         pellet.present = 1.0f;
         pellet.left = clamp(-offset.x / radius, 0.0f, 1.0f);
@@ -411,14 +424,12 @@ AgentObservation observe_environment(
         pellet.down = clamp(offset.y / radius, 0.0f, 1.0f);
     }
 
-    constexpr float FULL_TURN = 2.0f * numbers::pi_v<float>;
-
-    for (uint32_t ray = 0; ray < wall_ray_count; ++ray)
+    for (uint32_t ray = 0; ray < wall_ray_directions.size(); ++ray)
     {
-        const float angle = -numbers::pi_v<float> * 0.5f
-            + FULL_TURN * static_cast<float>(ray) / static_cast<float>(wall_ray_count);
-        const Vec2 direction{cos(angle), sin(angle)};
-        const float distance = navigable_ray_distance(environment, direction);
+        const float distance = navigable_ray_distance(
+            environment,
+            wall_ray_directions[ray],
+            wall_ray_intervals);
         observation.wall_proximity[ray] = clamp(1.0f - distance / radius, 0.0f, 1.0f);
     }
 
@@ -434,6 +445,32 @@ AgentObservation observe_environment(
             / static_cast<float>(environment.starvation_ticks()),
         0.0f,
         1.0f);
+}
+
+}
+
+// creates a bounded local observation without rendering dependencies
+AgentObservation observe_environment(
+    const Environment& environment,
+    uint32_t pellet_slots,
+    uint32_t wall_ray_count)
+{
+    if (wall_ray_count < 4U || wall_ray_count % 4U != 0U)
+    {
+        throw invalid_argument("agent observation wall rays must be a positive multiple of four");
+    }
+
+    AgentObservation observation;
+    vector<RayInterval> wall_ray_intervals;
+    vector<pair<float, uint32_t>> visible_pellets;
+    const vector<Vec2> wall_ray_directions = make_wall_ray_directions(wall_ray_count);
+    update_environment_observation(
+        environment,
+        pellet_slots,
+        wall_ray_directions,
+        wall_ray_intervals,
+        visible_pellets,
+        observation);
     return observation;
 }
 
@@ -441,7 +478,9 @@ AgentObservation observe_environment(
 BrainAgent::BrainAgent(
     const EnvironmentConfig& environment_config,
     BrainAgentConfig config,
-    uint64_t seed)
+    uint64_t seed,
+    BrainExecutionConfig execution,
+    BrainSimulatorFactory simulator_factory)
     : environment_config_(environment_config),
       config_(prepare_agent_config(move(config))),
       seed_(seed),
@@ -452,13 +491,19 @@ BrainAgent::BrainAgent(
           OUTPUT_CHANNELS,
           environment_config_.fixed_time_step,
           config_.controller,
-          seed_)
+          seed_,
+          execution,
+          simulator_factory)
 {
     validate_agent_config(config_);
     const double environment_step = static_cast<double>(environment_config_.fixed_time_step);
     wall_feedback_interval_ticks_ = duration_ticks(
         config_.wall_feedback_interval_seconds,
         environment_step);
+    wall_ray_directions_ = make_wall_ray_directions(config_.wall_ray_count);
+    visible_pellets_.reserve(pellet_slots_);
+    observation_.pellets.resize(pellet_slots_);
+    observation_.wall_proximity.resize(config_.wall_ray_count);
     normalized_inputs_.resize(sensory_input_count_);
     reset_episode(0U);
 }
@@ -486,7 +531,13 @@ Action BrainAgent::decide(const Environment& environment)
         --wall_feedback_cooldown_;
     }
 
-    observation_ = observe_environment(environment, pellet_slots_, config_.wall_ray_count);
+    update_environment_observation(
+        environment,
+        pellet_slots_,
+        wall_ray_directions_,
+        wall_ray_intervals_,
+        visible_pellets_,
+        observation_);
     flatten_observation(observation_, normalized_inputs_);
     const AdaptiveControllerStatus& controller_status = controller_.step(normalized_inputs_);
 
@@ -538,7 +589,13 @@ void BrainAgent::reset_episode(uint64_t episode_seed)
 {
     controller_.reset_episode(episode_seed);
     wall_feedback_cooldown_ = 0U;
-    observation_ = {};
+    fill(observation_.pellets.begin(), observation_.pellets.end(), PelletObservation{});
+    fill(observation_.wall_proximity.begin(), observation_.wall_proximity.end(), 0.0f);
+    observation_.velocity = {};
+    observation_.hunger = 0.0f;
+    observation_.visible_pellets = 0U;
+    wall_ray_intervals_.clear();
+    visible_pellets_.clear();
     fill(normalized_inputs_.begin(), normalized_inputs_.end(), 0.0f);
     status_ = {};
 }
@@ -559,6 +616,18 @@ void BrainAgent::set_exploration_enabled(bool enabled)
 void BrainAgent::load_connection_strengths(span<const float> strengths)
 {
     controller_.load_connection_strengths(strengths);
+}
+
+// returns a host copy of the learned connection strengths
+vector<float> BrainAgent::copy_connection_strengths() const
+{
+    return controller_.copy_connection_strengths();
+}
+
+// returns a full host snapshot for diagnostics outside the hot path
+BrainState BrainAgent::copy_state() const
+{
+    return controller_.copy_state();
 }
 
 // returns the fixed construction seed for this brain
@@ -609,10 +678,16 @@ const AdaptiveController& BrainAgent::controller() const
     return controller_;
 }
 
-// returns the cpu brain simulator for recording and inspection
-const CpuBrainSimulator& BrainAgent::simulator() const
+// returns the immutable compiled brain model
+const BrainModel& BrainAgent::model() const
 {
-    return controller_.simulator();
+    return controller_.model();
+}
+
+// returns the explicit execution backend
+BrainBackend BrainAgent::backend() const
+{
+    return controller_.backend();
 }
 
 }
