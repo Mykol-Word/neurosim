@@ -13,10 +13,12 @@ add_library(neurosim_core
     src/brain.cpp
     src/brain_agent.cpp
     src/brain_checkpoint.cpp
+    src/brain_genome.cpp
     src/brain_simulator.cpp
     src/cpu_brain.cpp
     src/dungeon.cpp
     src/environment.cpp
+    src/evolution.cpp
 )
 
 target_include_directories(neurosim_core PUBLIC include)
@@ -36,12 +38,18 @@ add_executable(neurosim_train apps/train_main.cpp)
 target_link_libraries(neurosim_train PRIVATE neurosim_core)
 target_compile_definitions(neurosim_train PRIVATE NEUROSIM_VERSION="${PROJECT_VERSION}")
 
+add_executable(neurosim_evolve apps/evolve_main.cpp)
+target_link_libraries(neurosim_evolve PRIVATE neurosim_core)
+target_compile_definitions(neurosim_evolve PRIVATE NEUROSIM_VERSION="${PROJECT_VERSION}")
+
 if(MSVC)
     target_compile_options(neurosim_headless PRIVATE /W4 /permissive- /EHsc)
     target_compile_options(neurosim_train PRIVATE /W4 /permissive- /EHsc)
+    target_compile_options(neurosim_evolve PRIVATE /W4 /permissive- /EHsc)
 else()
     target_compile_options(neurosim_headless PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(neurosim_train PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(neurosim_evolve PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 if(NEUROSIM_BUILD_VIEWER)
@@ -108,6 +116,7 @@ if(NEUROSIM_BUILD_CUDA)
     endif()
 
     target_link_libraries(neurosim_train PRIVATE neurosim_cuda)
+    target_link_libraries(neurosim_evolve PRIVATE neurosim_cuda)
 
     if(TARGET neurosim_game)
         target_link_libraries(neurosim_game PRIVATE neurosim_cuda)
@@ -129,22 +138,34 @@ if(BUILD_TESTING)
     add_executable(neurosim_checkpoint_tests tests/checkpoint_tests.cpp)
     target_link_libraries(neurosim_checkpoint_tests PRIVATE neurosim_core)
 
+    add_executable(neurosim_genome_tests tests/genome_tests.cpp)
+    target_link_libraries(neurosim_genome_tests PRIVATE neurosim_core)
+
+    add_executable(neurosim_evolution_tests tests/evolution_tests.cpp)
+    target_link_libraries(neurosim_evolution_tests PRIVATE neurosim_core)
+
     if(MSVC)
         target_compile_options(neurosim_tests PRIVATE /W4 /permissive- /EHsc)
         target_compile_options(neurosim_brain_tests PRIVATE /W4 /permissive- /EHsc)
         target_compile_options(neurosim_agent_tests PRIVATE /W4 /permissive- /EHsc)
         target_compile_options(neurosim_checkpoint_tests PRIVATE /W4 /permissive- /EHsc)
+        target_compile_options(neurosim_genome_tests PRIVATE /W4 /permissive- /EHsc)
+        target_compile_options(neurosim_evolution_tests PRIVATE /W4 /permissive- /EHsc)
     else()
         target_compile_options(neurosim_tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(neurosim_brain_tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(neurosim_agent_tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(neurosim_checkpoint_tests PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(neurosim_genome_tests PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(neurosim_evolution_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
     add_test(NAME neurosim_tests COMMAND neurosim_tests)
     add_test(NAME neurosim_brain_tests COMMAND neurosim_brain_tests)
     add_test(NAME neurosim_agent_tests COMMAND neurosim_agent_tests)
     add_test(NAME neurosim_checkpoint_tests COMMAND neurosim_checkpoint_tests)
+    add_test(NAME neurosim_genome_tests COMMAND neurosim_genome_tests)
+    add_test(NAME neurosim_evolution_tests COMMAND neurosim_evolution_tests)
 
     if(NEUROSIM_BUILD_CUDA)
         add_executable(neurosim_cuda_tests tests/cuda_brain_tests.cpp)

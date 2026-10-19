@@ -169,6 +169,35 @@ void test_default_brain_capacity()
         "default brain internal neuron capacity is incorrect");
 }
 
+// verifies an explicit genome reconstructs the same task-facing runtime model
+void test_explicit_genome_reconstructs_agent()
+{
+    const EnvironmentConfig environment_config = make_environment_config();
+    const BrainAgentConfig agent_config = make_agent_config();
+    const BrainAgent source(environment_config, agent_config, 17);
+    const vector<float> strengths = source.copy_connection_strengths();
+    const BrainGenome genome = make_brain_genome(source.model(), strengths);
+    const BrainAgent reconstructed(
+        environment_config,
+        agent_config,
+        91,
+        {},
+        nullptr,
+        &genome);
+    const BrainModel& expected = source.model();
+    const BrainModel& actual = reconstructed.model();
+
+    check(actual.positions == expected.positions
+            && actual.polarities == expected.polarities
+            && actual.bias_drives == expected.bias_drives
+            && actual.input_neurons == expected.input_neurons
+            && actual.output_neurons == expected.output_neurons
+            && actual.initial_connection_strengths == expected.initial_connection_strengths,
+        "explicit genome did not reconstruct the original runtime model");
+    check(reconstructed.copy_connection_strengths() == strengths,
+        "explicit genome did not restore its inherited strengths");
+}
+
 // verifies generic seeded input and output selection is distinct and reproducible
 void test_seeded_controller_interfaces_are_reproducible()
 {
@@ -292,7 +321,7 @@ void test_exploration_is_task_blind()
         {1.0f, 0.0f, 1.0f}
     };
     AdaptiveController quiet(4, 3, CONTROL_TIME_STEP, config, 81);
-    AdaptiveController stimulated(4, 3, CONTROL_TIME_STEP, config, 81);
+    AdaptiveController stimulated(4, 3, CONTROL_TIME_STEP, config, 82);
     quiet.reset_episode(19);
     stimulated.reset_episode(19);
     const vector<float> quiet_inputs(4, 0.0f);
@@ -309,7 +338,7 @@ void test_exploration_is_task_blind()
         check(stimulated_status.exploring == quiet_status.exploring,
             "observation values changed the exploration schedule");
         check(stimulated_status.exploration_outputs == quiet_status.exploration_outputs,
-            "observation values changed the exploration pattern");
+            "brain construction or observations changed the exploration pattern");
         stimulated.apply_modulation(tick % 2U == 0U ? 0.6f : -0.2f);
     }
 }
@@ -529,6 +558,8 @@ int main()
         {"visible_pellets_are_complete_and_ordered", test_visible_pellets_are_complete_and_ordered},
         {"wall_rays_use_navigable_geometry", test_wall_rays_use_navigable_geometry},
         {"default_brain_capacity", test_default_brain_capacity},
+        {"explicit_genome_reconstructs_agent",
+            test_explicit_genome_reconstructs_agent},
         {"seeded_controller_interfaces_are_reproducible",
             test_seeded_controller_interfaces_are_reproducible},
         {"exploration_is_task_blind", test_exploration_is_task_blind},

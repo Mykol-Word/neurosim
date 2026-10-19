@@ -66,8 +66,15 @@ AdaptiveControllerConfig prepare_config(
     AdaptiveControllerConfig config,
     uint32_t input_count,
     uint32_t output_count,
-    float control_time_step_seconds)
+    float control_time_step_seconds,
+    const BrainGenome* genome)
 {
+    if (genome != nullptr)
+    {
+        config.brain = genome->config;
+        config.brain_time_step_seconds = genome->config.dynamics.fixed_time_step_seconds;
+    }
+
     if (input_count == 0U || output_count == 0U)
     {
         throw invalid_argument("controller input and output counts must be positive");
@@ -208,8 +215,30 @@ BrainModel make_controller_model(
     const AdaptiveControllerConfig& config,
     uint32_t input_count,
     uint32_t output_count,
-    uint64_t seed)
+    uint64_t seed,
+    const BrainGenome* genome)
 {
+    if (genome != nullptr)
+    {
+        if (genome->input_positions.size()
+                != static_cast<size_t>(input_count) + output_count
+            || genome->output_positions.size() != output_count)
+        {
+            throw invalid_argument("controller genome interface count is incompatible");
+        }
+
+        for (uint32_t output = 0; output < output_count; ++output)
+        {
+            if (genome->input_positions[input_count + output]
+                != genome->output_positions[output])
+            {
+                throw invalid_argument("controller genome output drive mapping is incompatible");
+            }
+        }
+
+        return build_brain_model(*genome);
+    }
+
     return build_brain_model(
         make_controller_layout(config, input_count, output_count, seed),
         config.brain,
@@ -223,7 +252,8 @@ unique_ptr<BrainSimulator> make_controller_simulator(
     uint32_t output_count,
     uint64_t seed,
     const BrainExecutionConfig& execution,
-    BrainSimulatorFactory simulator_factory)
+    BrainSimulatorFactory simulator_factory,
+    const BrainGenome* genome)
 {
     if (execution.cuda_device < 0)
     {
@@ -241,7 +271,7 @@ unique_ptr<BrainSimulator> make_controller_simulator(
     }
 
     unique_ptr<BrainSimulator> simulator = simulator_factory(
-        make_controller_model(config, input_count, output_count, seed),
+        make_controller_model(config, input_count, output_count, seed, genome),
         execution);
 
     if (simulator == nullptr || simulator->backend() != execution.backend)
@@ -254,7 +284,7 @@ unique_ptr<BrainSimulator> make_controller_simulator(
 
 }
 
-// constructs reproducible random interfaces using only channel counts and a seed
+// constructs a reproducible seeded or explicit task-neutral brain
 AdaptiveController::AdaptiveController(
     uint32_t input_count,
     uint32_t output_count,
@@ -262,12 +292,14 @@ AdaptiveController::AdaptiveController(
     AdaptiveControllerConfig config,
     uint64_t seed,
     BrainExecutionConfig execution,
-    BrainSimulatorFactory simulator_factory)
+    BrainSimulatorFactory simulator_factory,
+    const BrainGenome* genome)
     : config_(prepare_config(
           move(config),
           input_count,
           output_count,
-          control_time_step_seconds)),
+          control_time_step_seconds,
+          genome)),
       execution_(execution),
       seed_(seed),
       input_count_(input_count),
@@ -279,7 +311,8 @@ AdaptiveController::AdaptiveController(
           output_count_,
           seed_,
           execution_,
-          simulator_factory))
+          simulator_factory,
+          genome))
 {
     exploration_interval_ticks_ = duration_ticks(
         config_.exploration_interval_seconds,
@@ -397,11 +430,11 @@ void AdaptiveController::apply_modulation(float value)
     }
 }
 
-// clears activity and restarts seeded exploration while preserving learned strengths
-void AdaptiveController::reset_episode(uint64_t episode_seed)
+// clears activity and restarts an independent exploration stream
+void AdaptiveController::reset_episode(uint64_t exploration_seed)
 {
     simulator_->reset_activity();
-    exploration_seed_ = mix_seed(seed_ ^ episode_seed ^ 0x632be59bd9b4e019ULL);
+    exploration_seed_ = mix_seed(exploration_seed ^ 0x632be59bd9b4e019ULL);
     control_tick_ = 0U;
     next_exploration_tick_ = 0U;
     exploration_ticks_remaining_ = 0U;

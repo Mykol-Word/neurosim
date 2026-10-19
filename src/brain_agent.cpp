@@ -474,13 +474,14 @@ AgentObservation observe_environment(
     return observation;
 }
 
-// constructs a random sparse brain compatible with one environment configuration
+// constructs a seeded or explicit brain compatible with one environment configuration
 BrainAgent::BrainAgent(
     const EnvironmentConfig& environment_config,
     BrainAgentConfig config,
     uint64_t seed,
     BrainExecutionConfig execution,
-    BrainSimulatorFactory simulator_factory)
+    BrainSimulatorFactory simulator_factory,
+    const BrainGenome* genome)
     : environment_config_(environment_config),
       config_(prepare_agent_config(move(config))),
       seed_(seed),
@@ -493,7 +494,8 @@ BrainAgent::BrainAgent(
           config_.controller,
           seed_,
           execution,
-          simulator_factory)
+          simulator_factory,
+          genome)
 {
     validate_agent_config(config_);
     const double environment_step = static_cast<double>(environment_config_.fixed_time_step);

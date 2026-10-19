@@ -1,5 +1,6 @@
 #pragma once
 
+#include "neurosim/brain_genome.h"
 #include "neurosim/brain_simulator.h"
 
 #include <cstdint>
@@ -42,7 +43,7 @@ struct AdaptiveControllerStatus
 class AdaptiveController
 {
 public:
-    // constructs reproducible random interfaces using only channel counts and a seed
+    // constructs a reproducible seeded or explicit task-neutral brain
     AdaptiveController(
         uint32_t input_count,
         uint32_t output_count,
@@ -50,7 +51,8 @@ public:
         AdaptiveControllerConfig config = {},
         uint64_t seed = 1,
         BrainExecutionConfig execution = {},
-        BrainSimulatorFactory simulator_factory = nullptr);
+        BrainSimulatorFactory simulator_factory = nullptr,
+        const BrainGenome* genome = nullptr);
 
     // advances one control step from normalized task-owned inputs
     const AdaptiveControllerStatus& step(span<const float> normalized_inputs);
@@ -58,8 +60,8 @@ public:
     // applies one task-owned signed outcome to recent local eligibility
     void apply_modulation(float value);
 
-    // clears activity and restarts seeded exploration while preserving learned strengths
-    void reset_episode(uint64_t episode_seed);
+    // clears activity and restarts an independent exploration stream
+    void reset_episode(uint64_t exploration_seed);
 
     // enables or disables task-blind output exploration
     void set_exploration_enabled(bool enabled);

@@ -642,7 +642,8 @@ int run(const Options& options)
             BrainAgentConfig{},
             brain_seed,
             execution,
-            backend_factory(options.backend));
+            backend_factory(options.backend),
+            checkpoint ? &checkpoint->genome : nullptr);
 
         if (checkpoint)
         {

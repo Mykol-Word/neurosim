@@ -4,7 +4,7 @@ This document records the current connection between the plastic spiking brain a
 
 ## General boundary
 
-`AdaptiveController` is task-neutral. It receives only a fixed count of normalized input channels, a fixed count of anonymous output channels, a control timestep, a set of valid output exploration patterns, signed scalar modulation, and seeds. It has no knowledge of pellets, walls, hunger, movement directions, scores, episode endings, or dungeon generation.
+`AdaptiveController` is task-neutral. It receives only a fixed count of normalized input channels, a fixed count of anonymous output channels, a control timestep, a set of valid output exploration patterns, signed scalar modulation, a construction seed, and an independent per-episode exploration seed. It has no knowledge of pellets, walls, hunger, movement directions, scores, episode endings, or dungeon generation.
 
 The controller builds the default brain as a radius-`10.65` sphere in a `23 x 23 x 23` lattice. This occupies 5,041 cells: 837 sensory neurons, four output neurons, and 4,200 unassigned internal neurons with the default dungeon interface. Sensor and output neurons are selected reproducibly without replacement from all occupied neurons using the brain seed. Their positions have no semantic ordering or distance constraint. Output neurons receive the same seeded polarity and bias policy as every other neuron: 20 percent inhibitory polarity and one bias sampled from the common `30` to `47.5` range. There is no output-only bias or forced output polarity.
 
@@ -50,7 +50,7 @@ Validation runs before training, every 25 episodes by default, and after a final
 
 The runner records versioned model, task, timing, backend, precision, seed, controller, dungeon adapter, and starting learned-state fingerprint metadata before episode results. Per-episode JSON includes score, wall hits, exploration and inactive steps, direction changes, movement alignment toward visible food, whole-brain and output firing rates, weight distribution, outgoing entropy, and elapsed time.
 
-The default checkpoint is `runs/brain-<seed>.nsbrain`. It contains a version, brain seed, model fingerprint, and learned strengths. Loading rejects a different topology, interface, seed, or relevant model configuration. Checkpoints made before the generic random controller interface was introduced are therefore incompatible and must be retrained. Transient voltage, spikes, traces, eligibility, and exploration state are intentionally not persisted.
+The default checkpoint is `runs/brain-<seed>.nsbrain`. Version 2 contains the complete genome, brain seed, model fingerprint, and learned strengths. Loading reconstructs explicit evolved anatomy and rejects a different interface, seed, or relevant model configuration. Version-1 seed-only checkpoints are incompatible because they cannot reconstruct evolved topology. Transient voltage, spikes, traces, eligibility, and exploration state are intentionally not persisted.
 
 ## Reset behavior
 

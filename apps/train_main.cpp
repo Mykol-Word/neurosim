@@ -139,6 +139,7 @@ void print_run_metadata(
     cout
         << ",\"first_environment_seed\":" << options.first_environment_seed
         << ",\"brain_seed\":" << agent.seed()
+        << ",\"exploration_random_stream\":\"episode_seed_only\""
         << ",\"episodes\":" << options.episodes
         << ",\"validation_interval\":" << options.validation_interval
         << ",\"validation_episodes\":" << options.validation_episodes
@@ -662,7 +663,8 @@ int main(int argc, char** argv)
             {},
             options.brain_seed,
             execution,
-            backend_factory(options.backend));
+            backend_factory(options.backend),
+            checkpoint ? &checkpoint->genome : nullptr);
 
         if (checkpoint)
         {

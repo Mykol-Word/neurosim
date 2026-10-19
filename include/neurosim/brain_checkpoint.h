@@ -1,6 +1,6 @@
 #pragma once
 
-#include "neurosim/brain.h"
+#include "neurosim/brain_genome.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -12,11 +12,12 @@ namespace neurosim
 
 using namespace std;
 
-// stores the persistent learned portion of one reproducible brain
+// stores one self-contained inherited brain and its learned strengths
 struct BrainCheckpoint
 {
     uint64_t brain_seed = 0;
     uint64_t model_fingerprint = 0;
+    BrainGenome genome;
     vector<float> connection_strengths;
 };
 
@@ -28,6 +29,13 @@ void save_brain_checkpoint(
     const filesystem::path& path,
     uint64_t brain_seed,
     const BrainModel& model,
+    span<const float> connection_strengths);
+
+// writes one genome and its learned strengths to one binary file
+void save_brain_checkpoint(
+    const filesystem::path& path,
+    uint64_t brain_seed,
+    const BrainGenome& genome,
     span<const float> connection_strengths);
 
 // reads one versioned binary brain checkpoint

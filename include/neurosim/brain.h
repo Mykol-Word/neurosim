@@ -28,6 +28,9 @@ struct GridShape
     uint32_t width = 1;
     uint32_t height = 1;
     uint32_t depth = 1;
+
+    // compares two lattice shapes for equality
+    bool operator==(const GridShape&) const = default;
 };
 
 // fixes the sign of every signal sent by one neuron
@@ -43,6 +46,9 @@ struct NeuronDefinition
     GridPosition position;
     NeuronPolarity polarity = NeuronPolarity::Excitatory;
     float bias_drive = 0.0f;
+
+    // compares two neuron definitions for equality
+    bool operator==(const NeuronDefinition&) const = default;
 };
 
 // describes occupied cells and ordered external input and output channels
@@ -63,6 +69,9 @@ struct NeuronDynamicsConfig
     float reset_potential = 0.0f;
     float firing_threshold = 1.0f;
     float refractory_period_seconds = 0.002f;
+
+    // compares two neuron dynamics configurations for equality
+    bool operator==(const NeuronDynamicsConfig&) const = default;
 };
 
 // configures local activity-trace learning and outgoing weight competition
@@ -76,6 +85,9 @@ struct PlasticityConfig
     float outgoing_strength_budget = 1.0f;
     float initial_budget_fraction = 1.0f;
     float initial_connection_density = 0.25f;
+
+    // compares two plasticity configurations for equality
+    bool operator==(const PlasticityConfig&) const = default;
 };
 
 // configures topology range, neuron dynamics, and plasticity
@@ -84,6 +96,9 @@ struct BrainConfig
     uint32_t connection_radius_steps = 2;
     NeuronDynamicsConfig dynamics;
     PlasticityConfig plasticity;
+
+    // compares two brain configurations for equality
+    bool operator==(const BrainConfig&) const = default;
 };
 
 // configures deterministic signed noise applied independently to every neuron

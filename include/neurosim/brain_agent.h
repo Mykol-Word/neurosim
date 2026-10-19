@@ -69,13 +69,14 @@ AgentObservation observe_environment(
 class BrainAgent
 {
 public:
-    // constructs a random sparse brain compatible with one environment configuration
+    // constructs a seeded or explicit brain compatible with one environment configuration
     BrainAgent(
         const EnvironmentConfig& environment_config,
         BrainAgentConfig config = {},
         uint64_t seed = 1,
         BrainExecutionConfig execution = {},
-        BrainSimulatorFactory simulator_factory = nullptr);
+        BrainSimulatorFactory simulator_factory = nullptr,
+        const BrainGenome* genome = nullptr);
 
     // observes the current environment and returns one simultaneous movement action
     Action decide(const Environment& environment);
